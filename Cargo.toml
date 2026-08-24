@@ -1,3 +1,16 @@
 [workspace]
 members = ["crates/boomerang-core", "crates/boomerang-cli"]
 resolver = "2"
+
+# Size-tuned release profile. Deliberately keeps panic=unwind (the default)
+# rather than panic="abort": the MCP server is a long-running process, and
+# unwind is what lets it catch a panic in a single request's handling
+# (see mcp.rs) without the whole server going down and dropping every other
+# in-flight session. That costs a little binary size (unwind tables) in
+# exchange for a real robustness property; everything else here is a free
+# size win with no behavior change.
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true

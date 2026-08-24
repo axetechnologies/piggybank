@@ -50,7 +50,21 @@ impl Store {
         Ok(id)
     }
 
+    /// Fetch content by id. Confirmed real, not theoretical: before this
+    /// validation existed, `get("../../../../etc/passwd")` or an absolute
+    /// path (`PathBuf::join` doesn't sanitize either — an absolute joined
+    /// path *replaces* the base entirely) read arbitrary files off the
+    /// filesystem, reachable straight through the MCP `boomerang_retrieve`
+    /// tool. `put` always generates its own id via `hex::encode(sha256)`,
+    /// so it's never handed an externally-controlled path fragment — only
+    /// `get` needed this, but it needed it badly.
     pub fn get(&self, id: &str) -> std::io::Result<Vec<u8>> {
+        if !is_valid_id(id) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid content id",
+            ));
+        }
         fs::read(self.root.join(id))
     }
 
@@ -64,9 +78,7 @@ impl Store {
         for entry in fs::read_dir(&self.root)? {
             let entry = entry?;
             let name = entry.file_name();
-            let is_content_id = name
-                .to_str()
-                .is_some_and(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()));
+            let is_content_id = name.to_str().is_some_and(is_valid_id);
             if is_content_id && entry.file_type()?.is_file() {
                 entries += 1;
                 bytes += entry.metadata()?.len();
@@ -74,6 +86,14 @@ impl Store {
         }
         Ok(StoreStats { entries, bytes })
     }
+}
+
+/// A valid content id is exactly what `hex::encode(Sha256::digest(_))`
+/// always produces: 64 lowercase hex characters, nothing else — no `/`, no
+/// `..`, no leading `/` (which would make it absolute). Shared by `get` and
+/// `stats` so "what counts as a real id" can't drift between the two.
+fn is_valid_id(id: &str) -> bool {
+    id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 pub struct StoreStats {
@@ -132,6 +152,38 @@ mod tests {
             vec![id],
             "no leftover .tmp file after a successful put"
         );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn get_rejects_path_traversal_and_absolute_paths() {
+        // Confirmed real (not theoretical) before this validation existed:
+        // reachable straight through the MCP boomerang_retrieve tool with
+        // an attacker-controlled `ref`, this read files far outside the
+        // store directory.
+        let dir =
+            std::env::temp_dir().join(format!("boomerang-traversal-test-{}", std::process::id()));
+        let store = Store::open(&dir).unwrap();
+        store.put(b"legitimate content").unwrap();
+
+        for malicious_id in [
+            "../../../../../../etc/passwd",
+            "/etc/passwd",
+            "..",
+            "",
+            "not-hex-but-64-characters-long-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        ] {
+            let result = store.get(malicious_id);
+            assert!(
+                result.is_err(),
+                "get({malicious_id:?}) must be rejected, not attempt a filesystem read"
+            );
+            assert_eq!(
+                result.unwrap_err().kind(),
+                std::io::ErrorKind::InvalidInput,
+                "must be rejected as invalid input, not fail for some other reason"
+            );
+        }
         fs::remove_dir_all(&dir).ok();
     }
 }

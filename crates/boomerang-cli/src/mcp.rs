@@ -54,7 +54,28 @@ pub fn serve(store_dir: &str) -> io::Result<()> {
         let response = match method {
             "initialize" => ok(id, initialize_result()),
             "tools/list" => ok(id, json!({ "tools": tool_defs() })),
-            "tools/call" => handle_tools_call(&state, id, &request),
+            // Caught, not just called: this is a long-running process
+            // serving a whole session's worth of requests. An unexpected
+            // panic in one request's handling (a bug we haven't found yet,
+            // an edge case in the compressors) must not take the entire
+            // server down and drop every other in-flight conversation with
+            // it - it should fail that one request and keep serving. Sound
+            // here specifically because catching a panic mid-`RefCell`
+            // borrow is safe: unwinding still runs the guard's destructor,
+            // so the borrow flag is left consistent either way.
+            "tools/call" => {
+                let id_for_panic = id.clone();
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    handle_tools_call(&state, id, &request)
+                }))
+                .unwrap_or_else(|_| {
+                    err(
+                        id_for_panic,
+                        -32603,
+                        "internal error: request handler panicked",
+                    )
+                })
+            }
             other => err(id, -32601, &format!("method not found: {other}")),
         };
 
