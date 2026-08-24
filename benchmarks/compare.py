@@ -69,6 +69,16 @@ import json, sys, time
 from headroom import compress
 from headroom.transforms.kompress_compressor import KompressCompressor
 
+# headroom's own compress() API requires *some* model name (it uses this for
+# token counting and context-window bookkeeping, not for routing/compression
+# decisions, which are content-driven). This is a property of headroom's
+# API being tested, not of boomerang, which has zero model/provider coupling
+# anywhere in its own source - grep crates/ if you want to confirm that
+# yourself. Swap this for any model headroom's tokenizer registry supports;
+# it doesn't change what's being compared.
+HEADROOM_TARGET_MODEL = "claude-sonnet-4-5-20250929"
+HEADROOM_TARGET_MODEL_LIMIT = 200000
+
 files = json.loads(sys.stdin.read())
 
 warm = KompressCompressor()
@@ -95,7 +105,7 @@ results = {"warmup_s": warmup_s, "files": {}}
 for name, content in files.items():
     messages = wrap(content)
     start = time.monotonic()
-    result = compress(messages, model="claude-sonnet-4-5-20250929", model_limit=200000)
+    result = compress(messages, model=HEADROOM_TARGET_MODEL, model_limit=HEADROOM_TARGET_MODEL_LIMIT)
     elapsed = time.monotonic() - start
     block = next(b for b in result.messages[3]["content"] if isinstance(b, dict) and b.get("type") == "tool_result")
     target = block["content"]
