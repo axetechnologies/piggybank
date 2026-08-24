@@ -1,7 +1,7 @@
 use crate::markers::{escape_lines, strip_pua, unescape_lines, PUA};
 use crate::Store;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct TextOptions {
     /// Collapse a run of >= this many *consecutive* identical lines into
     /// one copy plus a repeat marker. Must be >= 2.
@@ -75,10 +75,15 @@ pub fn compress_text(store: &Store, input: &[u8], opts: &TextOptions) -> std::io
     let tail = &lines[lines.len() - keep_tail..];
     let middle = &lines[keep_head..lines.len() - keep_tail];
 
-    let id = store.put(middle.join("\n").as_bytes())?;
-
     let mut out = dedup_lines(head, opts.dedup_min_repeat);
-    out.push(elide_marker(middle.len(), &id));
+    if !middle.is_empty() {
+        // "".split('\n') yields one empty element, not zero - eliding an
+        // empty middle (keep_head+keep_tail covering the whole input) would
+        // otherwise store "" and reintroduce a line that was never there,
+        // as well as being a marker that elides nothing.
+        let id = store.put(middle.join("\n").as_bytes())?;
+        out.push(elide_marker(middle.len(), &id));
+    }
     out.extend(dedup_lines(tail, opts.dedup_min_repeat));
     Ok(out.join("\n").into_bytes())
 }
@@ -347,5 +352,72 @@ mod tests {
         let store = temp_store();
         let input = format!("before\n{PUA}\u{E001}already escaped looking\nafter");
         assert_round_trips(&store, input.as_bytes(), &TextOptions::default());
+    }
+
+    #[test]
+    fn keep_head_and_tail_covering_the_whole_input_elides_nothing() {
+        // Found by proptest, minimized from a 3-line input: when
+        // keep_head+keep_tail >= total lines, the middle span is empty.
+        // "".split('\n') yields one empty element, not zero, so eliding an
+        // empty middle used to silently reintroduce a line that was never
+        // there. Must not push an elide marker at all in this case.
+        let store = temp_store();
+        let opts = TextOptions {
+            dedup_min_repeat: 2,
+            elide_threshold_lines: 1,
+            keep_head: 1,
+            keep_tail: 2,
+        };
+        assert_round_trips(&store, b"\n\n", &opts);
+    }
+
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Lines, deliberately biased toward marker-shaped and
+        /// PUA-containing content rather than uniformly random text - the
+        /// collision-prone area this module cares most about, and exactly
+        /// the shape that caught the cross-content leak bug.
+        fn arb_line() -> impl Strategy<Value = String> {
+            prop_oneof![
+                4 => "[a-zA-Z0-9 ]{0,20}",
+                1 => Just(format!("{PUA}BOOMERANG:ELIDE:5:deadbeefdeadbeefdeadbeefdeadbeefdeadbeef{PUA}")),
+                1 => Just(format!("{PUA}BOOMERANG:REPEAT:3{PUA}")),
+                1 => Just(format!("{PUA}BOOMERANG:RAW:deadbeefdeadbeefdeadbeefdeadbeefdeadbeef{PUA}")),
+                1 => "[a-zA-Z]{0,8}".prop_map(|s| format!("{PUA}{s}")),
+                1 => "[a-zA-Z]{0,8}".prop_map(|s| format!("{PUA}\u{E001}{s}")),
+            ]
+        }
+
+        fn arb_text() -> impl Strategy<Value = String> {
+            prop::collection::vec(arb_line(), 0..40).prop_map(|lines| lines.join("\n"))
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(512))]
+
+            #[test]
+            fn arbitrary_text_round_trips(text in arb_text(), opts in arb_opts()) {
+                let store = temp_store();
+                let compressed = compress_text(&store, text.as_bytes(), &opts).unwrap();
+                let restored = decompress_text(&store, &compressed).unwrap();
+                prop_assert_eq!(restored, text.into_bytes());
+            }
+        }
+
+        /// Vary the thresholds too, not just content - default options
+        /// (60-line threshold) rarely trigger elision on the short
+        /// generated inputs above, so most runs would only exercise dedup.
+        fn arb_opts() -> impl Strategy<Value = TextOptions> {
+            (2..5usize, 1..20usize, 0..5usize, 0..5usize).prop_map(
+                |(dedup_min_repeat, elide_threshold_lines, keep_head, keep_tail)| TextOptions {
+                    dedup_min_repeat,
+                    elide_threshold_lines,
+                    keep_head,
+                    keep_tail,
+                },
+            )
+        }
     }
 }

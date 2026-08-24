@@ -444,4 +444,50 @@ mod tests {
         let restored = session.decompress(&compressed).unwrap();
         assert_eq!(restored, new.into_bytes());
     }
+
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// A handful of keys reused across ops (not unique per-op), so
+        /// generated sequences actually exercise first-sight/unchanged/diff
+        /// transitions on the same key repeatedly - a sequence of all-new
+        /// keys would only ever hit the trivial first-sight path.
+        fn arb_key() -> impl Strategy<Value = String> {
+            prop_oneof!["a.txt", "b.txt", "c.txt"].prop_map(String::from)
+        }
+
+        fn arb_line() -> impl Strategy<Value = String> {
+            prop_oneof![
+                4 => "[a-zA-Z0-9 ]{0,15}",
+                1 => Just(format!("{PUA}BOOMERANG:UNCHANGED:deadbeefdeadbeefdeadbeefdeadbeefdeadbeef{PUA}")),
+                1 => Just(format!("{PUA}BOOMERANG:DIFF:deadbeefdeadbeefdeadbeefdeadbeefdeadbeef{PUA}")),
+                1 => Just(format!("{PUA}BOOMERANG:SAME:3{PUA}")),
+            ]
+        }
+
+        fn arb_content() -> impl Strategy<Value = String> {
+            prop::collection::vec(arb_line(), 0..10).prop_map(|lines| lines.join("\n"))
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(256))]
+
+            /// Every step's compress -> decompress must round-trip exactly,
+            /// checked immediately after each op against a session whose
+            /// state keeps evolving underneath it - the property the whole
+            /// diff-against-last-seen mechanism exists to guarantee.
+            #[test]
+            fn arbitrary_op_sequence_round_trips(
+                ops in prop::collection::vec((arb_key(), arb_content()), 1..12)
+            ) {
+                let session = Session::new(temp_store());
+                for (key, content) in ops {
+                    let compressed = session.compress(&key, content.as_bytes()).unwrap();
+                    let restored = session.decompress(&compressed).unwrap();
+                    prop_assert_eq!(restored, content.into_bytes());
+                }
+            }
+        }
+    }
 }

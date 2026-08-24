@@ -479,4 +479,60 @@ mod tests {
         );
         assert_round_trips(&input);
     }
+
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Object keys, deliberately biased toward our reserved namespace
+        /// (and toward duplicating a handful of short names, so generated
+        /// objects actually have repeated key sets worth columnarizing)
+        /// rather than uniformly random strings, which would rarely
+        /// exercise the collision-prone paths this module cares most about.
+        fn arb_key() -> impl Strategy<Value = String> {
+            prop_oneof![
+                3 => "[a-z]{1,4}",
+                1 => "__boomerang_[a-z_]{0,10}",
+                1 => "__boomerang_esc_[a-z_]{0,10}",
+            ]
+        }
+
+        fn arb_leaf() -> impl Strategy<Value = Value> {
+            prop_oneof![
+                Just(Value::Null),
+                any::<bool>().prop_map(Value::Bool),
+                any::<i32>().prop_map(|n| json!(n)),
+                "[a-zA-Z0-9 ]{0,12}".prop_map(Value::String),
+            ]
+        }
+
+        fn arb_json() -> impl Strategy<Value = Value> {
+            arb_leaf().prop_recursive(4, 64, 6, |inner| {
+                prop_oneof![
+                    prop::collection::vec(inner.clone(), 0..5).prop_map(Value::Array),
+                    prop::collection::vec((arb_key(), inner), 0..5).prop_map(|pairs| {
+                        // later entries win on duplicate keys, matching how
+                        // a real JSON object would already have collapsed them
+                        Value::Object(pairs.into_iter().collect())
+                    }),
+                ]
+            })
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(512))]
+
+            /// The one invariant, checked against generated input instead of
+            /// hand-picked cases - this is what actually caught the reserved-key
+            /// collision bug's sibling cases before they could ship.
+            #[test]
+            fn arbitrary_json_round_trips(value in arb_json()) {
+                let input = serde_json::to_vec(&value).unwrap();
+                let compressed = compress_json(&input).unwrap();
+                let decompressed = decompress_json(&compressed).unwrap();
+                let restored: Value = serde_json::from_slice(&decompressed).unwrap();
+                prop_assert_eq!(value, restored);
+            }
+        }
+    }
 }
