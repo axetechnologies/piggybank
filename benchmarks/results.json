@@ -1,21 +1,21 @@
 {
-  "headroom_warmup_s": 4.154857791998438,
+  "headroom_warmup_s": 12.65309870800047,
   "results": [
     {
       "file": "api_response.json",
       "raw_bytes": 20518,
       "raw_tokens": 6300,
       "headroom_tokens": 5683,
-      "headroom_elapsed_ms": 1433.7,
+      "headroom_elapsed_ms": 1967.0,
       "headroom_transforms": [
         "router:protected:user_message",
         "router:tool_result:mixed",
         "router:protected:user_message"
       ],
       "headroom_reduction_pct": 9.8,
-      "boomerang_tokens": 6240,
-      "boomerang_reduction_pct": 1.0,
-      "boomerang_elapsed_ms": 5.6,
+      "boomerang_tokens": 3995,
+      "boomerang_reduction_pct": 36.6,
+      "boomerang_elapsed_ms": 353.8,
       "boomerang_fidelity_ok": true
     },
     {
@@ -23,7 +23,7 @@
       "raw_bytes": 34041,
       "raw_tokens": 11156,
       "headroom_tokens": 9032,
-      "headroom_elapsed_ms": 2279.1,
+      "headroom_elapsed_ms": 2780.2,
       "headroom_transforms": [
         "router:protected:user_message",
         "router:tool_result:code_aware",
@@ -32,7 +32,7 @@
       "headroom_reduction_pct": 19.0,
       "boomerang_tokens": 3570,
       "boomerang_reduction_pct": 68.0,
-      "boomerang_elapsed_ms": 5.4,
+      "boomerang_elapsed_ms": 6.5,
       "boomerang_fidelity_ok": true
     },
     {
@@ -40,7 +40,7 @@
       "raw_bytes": 80403,
       "raw_tokens": 22780,
       "headroom_tokens": 22471,
-      "headroom_elapsed_ms": 74.1,
+      "headroom_elapsed_ms": 86.4,
       "headroom_transforms": [
         "router:protected:user_message",
         "router:tool_result:mixed",
@@ -49,7 +49,7 @@
       "headroom_reduction_pct": 1.4,
       "boomerang_tokens": 376,
       "boomerang_reduction_pct": 98.3,
-      "boomerang_elapsed_ms": 8.1,
+      "boomerang_elapsed_ms": 9.9,
       "boomerang_fidelity_ok": true
     }
   ]

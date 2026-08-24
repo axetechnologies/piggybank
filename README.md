@@ -38,12 +38,18 @@ the current state:
   disk). Writing the same content twice is a no-op. This is what makes
   compression reversible: a compressor never decides what's safe to discard,
   because nothing it stores here is ever discarded.
-- `compress_json` / `decompress_json` — **lossless** structural compression.
-  Homogeneous arrays of objects (the shape of almost every API response or
-  tool-result list) become a columnar table: keys written once, then rows of
-  values, instead of repeating every key name per element. This alone
-  doesn't need `Store` at all — there's nothing to hold back for later,
-  because no information is lost.
+- `compress_json` / `decompress_json` — **lossless** structural compression,
+  two composable passes. First, homogeneous arrays of objects (the shape of
+  almost every API response or tool-result list) become a columnar table:
+  keys written once, then rows of values, instead of repeating every key
+  name per element. Second, value interning: any subtree (object, array, or
+  string) that repeats anywhere in the result — e.g. the same GitHub-user
+  object attached to ten different commits — gets replaced, after its first
+  occurrence, with a short reference into a dictionary. Columnarization
+  alone only dedupes key *names* across rows; interning is what catches
+  repeated *values*, which is where most of the size actually lives in real
+  API responses. Neither pass needs `Store` — there's nothing to hold back
+  for later, because no information is lost.
 - `compress_text` / `decompress_text` — dedup of consecutive repeated lines
   (only when the collapse actually pays for itself) plus middle-elision past
   a line-count threshold, with the elided span held in `Store` and recovered
@@ -90,9 +96,10 @@ server (`boomerang mcp serve`), CI-checked on every push
 awareness at the MCP layer yet.
 
 See [`benchmarks/RESULTS.md`](benchmarks/RESULTS.md) for a real (not
-synthetic) comparison against headroom: boomerang wins decisively on
-structural/repetitive content (68–98% reduction on a build log and a git
-diff, 100–400x faster, zero warmup) and loses narrowly on a JSON case with
-mostly-unique per-row data, where headroom's ML-based semantic compressor
-found more to trim than structural dedup could. It's a mixed result, reported
-as one — see that file for the full analysis and its limitations.
+synthetic) comparison against headroom: boomerang wins on all three corpus
+files — 68–98% reduction on a build log and a git diff (5.6–400x faster,
+zero warmup), and 36.6% vs headroom's 9.8% on a GitHub API JSON response,
+after a real fix (value interning, not a knob turn) closed a genuine gap:
+columnarization alone missed ~9KB of repeated author/committer objects in a
+20.5KB file. See that file for the full analysis, what the fix cost
+(latency on large JSON, measured not assumed), and its limitations.
