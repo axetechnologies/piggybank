@@ -6,7 +6,9 @@ mod json;
 mod markers;
 mod session;
 mod text;
-pub use json::{compress_json, decompress_json};
+pub use json::{
+    compress_json, compress_json_with_store, decompress_json, decompress_json_with_store,
+};
 pub use session::Session;
 pub use text::{compress_text, decompress_text, TextOptions};
 
@@ -27,9 +29,18 @@ impl Store {
     }
 
     pub fn put(&self, bytes: &[u8]) -> std::io::Result<String> {
+        self.put_check_existing(bytes).map(|(id, _)| id)
+    }
+
+    /// Like `put`, but also reports whether this exact content was already
+    /// present *before* this call — the primitive cross-call deduplication
+    /// needs: "have I seen this value before, anywhere, ever" rather than
+    /// just "make sure it's stored." See `json::compress_json_with_store`.
+    pub fn put_check_existing(&self, bytes: &[u8]) -> std::io::Result<(String, bool)> {
         let id = hex::encode(Sha256::digest(bytes));
         let path = self.root.join(&id);
-        if !path.exists() {
+        let already_existed = path.exists();
+        if !already_existed {
             // fs::write alone isn't atomic - a process killed mid-write
             // (OOM, crash, power loss) could leave a truncated file at
             // `path` whose name (the content hash, computed from the
@@ -47,7 +58,7 @@ impl Store {
             fs::write(&tmp_path, bytes)?;
             fs::rename(&tmp_path, &path)?;
         }
-        Ok(id)
+        Ok((id, already_existed))
     }
 
     /// Fetch content by id. Confirmed real, not theoretical: before this

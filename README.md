@@ -57,6 +57,20 @@ the current state:
   repeated *values*, which is where most of the size actually lives in real
   API responses. Neither pass needs `Store` — there's nothing to hold back
   for later, because no information is lost.
+- `compress_json_with_store` / `decompress_json_with_store` — beyond
+  parity with headroom, not just matching it: cross-*call* structural
+  memory for JSON, the thing `Session` already gives text but JSON never
+  had. An agent polling the same status endpoint, or re-fetching a metadata
+  object that hasn't changed, has each repeat cost next to nothing starting
+  from the *second* time it's seen — content-addressed, so it works across
+  entirely different documents and calls, not just one tracked key. Same
+  "only commit if it actually shrinks" guarantee as everything else here
+  (the marker itself costs 89 bytes; anything smaller than that never gets
+  promoted, checked exactly, not just filtered by a threshold). This is
+  what the MCP server's `boomerang_compress`/`boomerang_decompress` use for
+  JSON; the plain `compress_json`/`decompress_json` above stay pure and
+  store-free for callers (like the CLI's `compress`/`decompress`) that want
+  a single, stateless, self-contained transform.
 - `compress_text` / `decompress_text` — dedup of consecutive repeated lines
   (only when the collapse actually pays for itself) plus middle-elision past
   a line-count threshold, with the elided span held in `Store` and recovered

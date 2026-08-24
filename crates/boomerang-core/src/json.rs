@@ -1,5 +1,7 @@
+use crate::Store;
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::io::{Error, ErrorKind, Result as IoResult};
 
 const TABLE_MARKER: &str = "__boomerang_table__";
 const INTERN_MARKER: &str = "__boomerang_intern__";
@@ -73,6 +75,138 @@ pub fn decompress_json(input: &[u8]) -> serde_json::Result<Vec<u8>> {
     let restored = decompress_value(&uninterned);
     let unescaped = unescape_reserved_keys(&restored);
     serde_json::to_vec(&unescaped)
+}
+
+/// Below this serialized length, cross-call promotion is never attempted -
+/// higher bar than `MIN_INTERN_LEN` because this costs an actual `Store`
+/// round-trip (a filesystem stat/read), not just a marker-size comparison.
+/// Set comfortably above the marker's own fixed cost
+/// (`{"__boomerang_cref__":"<64-hex-char id>"}` is 89 bytes) - this is only
+/// a cheap pre-filter, same role `MIN_INTERN_LEN` plays for `intern_value`;
+/// the actual guarantee is the exact size check in `cross_call_intern`
+/// below. Getting this wrong is a real bug, not just a missed optimization:
+/// an earlier version left this at 64, *below* the marker's own cost, so
+/// anything in the 64-89 byte range unconditionally grew on promotion -
+/// caught by actually reading compressed output during end-to-end testing,
+/// not by trusting size numbers alone.
+const CROSS_CALL_MIN_LEN: usize = 100;
+
+const CROSS_CALL_REF_MARKER: &str = "__boomerang_cref__";
+
+/// Cross-call, cross-document sibling of `compress_json`: everything it
+/// does, plus persistent structural memory via `store`. An agent that reads
+/// a similar or identical JSON blob across *separate* `compress` calls —
+/// polling a status endpoint, re-fetching a metadata object that hasn't
+/// changed, seeing the same paginated user record on page 2 as page 1 — has
+/// each repeat cost nothing once the first occurrence is on record,
+/// regardless of which document it was originally seen in. `Session`
+/// already gives text this kind of memory (diff against last seen, keyed
+/// by a caller-supplied key); this is the JSON-shaped, key-*free* version -
+/// content-addressing means the same value is recognized wherever it
+/// reappears, not just under one tracked key. compress_json itself stays a
+/// pure, store-free function for callers (like the plain CLI) that
+/// genuinely want a single, stateless, self-contained transform.
+///
+/// Mechanism: after the existing within-document passes, walk the result
+/// bottom-up; any object whose serialized form clears `CROSS_CALL_MIN_LEN`
+/// gets looked up in `store` by content hash. Seen before (by *any* prior
+/// call against this store, not just this document) → replaced with a
+/// `{"__boomerang_cref__": id}` reference. Not seen before → left inline,
+/// but written to `store` so the *next* call recognizes it. First sight of
+/// a large value costs nothing extra beyond a store write; every repeat
+/// after that costs almost nothing.
+pub fn compress_json_with_store(input: &[u8], store: &Store) -> IoResult<Vec<u8>> {
+    let value: Value = serde_json::from_slice(input).map_err(json_io_err)?;
+    let escaped = escape_reserved_keys(&value);
+    let columnarized = compress_value(&escaped);
+    let interned = intern_value(&columnarized);
+    let cross_call = cross_call_intern(&interned, store)?;
+    serde_json::to_vec(&cross_call).map_err(json_io_err)
+}
+
+pub fn decompress_json_with_store(input: &[u8], store: &Store) -> IoResult<Vec<u8>> {
+    let value: Value = serde_json::from_slice(input).map_err(json_io_err)?;
+    let resolved = resolve_cross_call_refs(&value, store)?;
+    let uninterned = unintern_value(&resolved);
+    let restored = decompress_value(&uninterned);
+    let unescaped = unescape_reserved_keys(&restored);
+    serde_json::to_vec(&unescaped).map_err(json_io_err)
+}
+
+fn json_io_err(e: serde_json::Error) -> Error {
+    Error::new(ErrorKind::InvalidData, e)
+}
+
+fn cross_call_intern(value: &Value, store: &Store) -> IoResult<Value> {
+    let recursed = match value {
+        Value::Array(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                out.push(cross_call_intern(item, store)?);
+            }
+            Value::Array(out)
+        }
+        Value::Object(map) => {
+            let mut out = serde_json::Map::with_capacity(map.len());
+            for (k, v) in map {
+                out.insert(k.clone(), cross_call_intern(v, store)?);
+            }
+            Value::Object(out)
+        }
+        other => return Ok(other.clone()), // scalars: never worth a store round trip
+    };
+
+    let serialized = serde_json::to_vec(&recursed).map_err(json_io_err)?;
+    if serialized.len() < CROSS_CALL_MIN_LEN {
+        return Ok(recursed);
+    }
+    let (id, already_existed) = store.put_check_existing(&serialized)?;
+    let marker = json!({ CROSS_CALL_REF_MARKER: &id });
+    let marker_len = serde_json::to_vec(&marker).map_err(json_io_err)?.len();
+    // Same "pay for itself" guarantee as intern_value's size check: even
+    // past the pre-filter above, only actually commit to the reference if
+    // it's smaller than what it replaces. CROSS_CALL_MIN_LEN alone isn't
+    // sufficient - it's a fixed threshold, but the marker's cost is also
+    // fixed, so this is the check that's actually always correct.
+    if already_existed && marker_len < serialized.len() {
+        Ok(marker)
+    } else {
+        Ok(recursed)
+    }
+}
+
+/// Reverses `cross_call_intern`. Resolves recursively: a value promoted
+/// while it *contained* an already-promoted child (a ref inside a ref) is
+/// stored with that nested reference embedded, so resolving one level isn't
+/// enough — keep resolving whatever comes back until no marker remains.
+fn resolve_cross_call_refs(value: &Value, store: &Store) -> IoResult<Value> {
+    if let Value::Object(map) = value {
+        if map.len() == 1 {
+            if let Some(id) = map.get(CROSS_CALL_REF_MARKER).and_then(Value::as_str) {
+                let bytes = store.get(id)?;
+                let resolved: Value = serde_json::from_slice(&bytes).map_err(json_io_err)?;
+                return resolve_cross_call_refs(&resolved, store);
+            }
+        }
+    }
+
+    match value {
+        Value::Array(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                out.push(resolve_cross_call_refs(item, store)?);
+            }
+            Ok(Value::Array(out))
+        }
+        Value::Object(map) => {
+            let mut out = serde_json::Map::with_capacity(map.len());
+            for (k, v) in map {
+                out.insert(k.clone(), resolve_cross_call_refs(v, store)?);
+            }
+            Ok(Value::Object(out))
+        }
+        other => Ok(other.clone()),
+    }
 }
 
 /// Rename any object key starting with `RESERVED_NAMESPACE` by prepending
@@ -480,6 +614,109 @@ mod tests {
         assert_round_trips(&input);
     }
 
+    fn temp_store() -> crate::Store {
+        let dir = std::env::temp_dir().join(format!(
+            "boomerang-json-store-test-{:?}-{}",
+            std::time::SystemTime::now(),
+            std::process::id()
+        ));
+        crate::Store::open(&dir).unwrap()
+    }
+
+    fn assert_round_trips_with_store(store: &crate::Store, input: &str) {
+        let original: Value = serde_json::from_str(input).unwrap();
+        let compressed = compress_json_with_store(input.as_bytes(), store).unwrap();
+        let decompressed = decompress_json_with_store(&compressed, store).unwrap();
+        let restored: Value = serde_json::from_slice(&decompressed).unwrap();
+        assert_eq!(original, restored, "round-trip must be exact");
+    }
+
+    #[test]
+    fn with_store_single_call_round_trips_same_as_without() {
+        let store = temp_store();
+        assert_round_trips_with_store(&store, r#"[{"id":1,"status":"ok"},{"id":2,"status":"ok"}]"#);
+    }
+
+    #[test]
+    fn repeated_large_value_across_separate_calls_shrinks_dramatically() {
+        // The actual capability: an agent polling the same status endpoint,
+        // or re-fetching a metadata object that hasn't changed, across
+        // SEPARATE compress calls (simulated here as two documents that
+        // share one large object but are otherwise unrelated in shape).
+        let store = temp_store();
+        let shared_object = format!(
+            r#"{{"account_id":"acct_9f2a1c","plan":"enterprise","region":"us-east-1","limits":{{"requests_per_min":10000,"seats":250}},"metadata":"{}"}}"#,
+            "x".repeat(120)
+        );
+
+        let doc1 = format!(r#"{{"kind":"page1","owner":{shared_object}}}"#);
+        let doc2 =
+            format!(r#"{{"kind":"page2","different_shape":[1,2,3],"owner":{shared_object}}}"#);
+
+        let compressed1 = compress_json_with_store(doc1.as_bytes(), &store).unwrap();
+        let compressed2 = compress_json_with_store(doc2.as_bytes(), &store).unwrap();
+
+        assert!(
+            compressed2.len() < doc2.len() / 2,
+            "second document's shared object should collapse well below half the size: {} vs {}",
+            compressed2.len(),
+            doc2.len()
+        );
+        // Prove it's actually cross-call interned, not coincidentally
+        // small: the account id should not appear verbatim in call 2's view.
+        assert!(!String::from_utf8_lossy(&compressed2).contains("acct_9f2a1c"));
+
+        let restored1: Value =
+            serde_json::from_slice(&decompress_json_with_store(&compressed1, &store).unwrap())
+                .unwrap();
+        let restored2: Value =
+            serde_json::from_slice(&decompress_json_with_store(&compressed2, &store).unwrap())
+                .unwrap();
+        assert_eq!(restored1, serde_json::from_str::<Value>(&doc1).unwrap());
+        assert_eq!(restored2, serde_json::from_str::<Value>(&doc2).unwrap());
+    }
+
+    #[test]
+    fn cross_call_ref_nested_inside_another_cross_call_ref_round_trips() {
+        // A value promoted on call 2 can itself CONTAIN an already-promoted
+        // reference from call 1 - resolve_cross_call_refs must keep
+        // resolving until no marker remains, not just one level.
+        let store = temp_store();
+        let inner = format!(r#"{{"payload":"{}"}}"#, "y".repeat(100));
+        let middle = format!(
+            r#"{{"wraps_inner":{inner},"tag":"middle-{}"}}"#,
+            "z".repeat(80)
+        );
+
+        compress_json_with_store(inner.as_bytes(), &store).unwrap(); // call 1: promote inner
+        compress_json_with_store(inner.as_bytes(), &store).unwrap(); // call 2: inner -> cref
+        let outer_doc = format!(r#"{{"a":{middle},"b":{middle}}}"#); // middle repeats -> promoted too, containing inner's cref
+        let compressed3 = compress_json_with_store(outer_doc.as_bytes(), &store).unwrap();
+        // call 4: outer_doc again - "a" and "b" now both resolve through a
+        // cref-inside-a-cref chain
+        let compressed4 = compress_json_with_store(outer_doc.as_bytes(), &store).unwrap();
+
+        let restored3: Value =
+            serde_json::from_slice(&decompress_json_with_store(&compressed3, &store).unwrap())
+                .unwrap();
+        let restored4: Value =
+            serde_json::from_slice(&decompress_json_with_store(&compressed4, &store).unwrap())
+                .unwrap();
+        let expected: Value = serde_json::from_str(&outer_doc).unwrap();
+        assert_eq!(restored3, expected);
+        assert_eq!(restored4, expected);
+    }
+
+    #[test]
+    fn input_containing_a_literal_cref_marker_round_trips_unchanged() {
+        // Same collision class already fixed for the other three markers -
+        // escape_reserved_keys protects this one too automatically, since
+        // CROSS_CALL_REF_MARKER lives in the same reserved namespace.
+        let store = temp_store();
+        let input = r#"{"metadata": {"__boomerang_cref__": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"}}"#;
+        assert_round_trips_with_store(&store, input);
+    }
+
     mod proptests {
         use super::*;
         use proptest::prelude::*;
@@ -532,6 +769,23 @@ mod tests {
                 let decompressed = decompress_json(&compressed).unwrap();
                 let restored: Value = serde_json::from_slice(&decompressed).unwrap();
                 prop_assert_eq!(value, restored);
+            }
+
+            /// Same invariant, but a whole SEQUENCE of generated documents
+            /// through one evolving store - the shape that actually
+            /// exercises cross_call_intern/resolve_cross_call_refs (a
+            /// single document never does, since promotion only fires on
+            /// a repeat).
+            #[test]
+            fn arbitrary_json_sequence_with_store_round_trips(values in prop::collection::vec(arb_json(), 1..8)) {
+                let store = temp_store();
+                for value in values {
+                    let input = serde_json::to_vec(&value).unwrap();
+                    let compressed = compress_json_with_store(&input, &store).unwrap();
+                    let decompressed = decompress_json_with_store(&compressed, &store).unwrap();
+                    let restored: Value = serde_json::from_slice(&decompressed).unwrap();
+                    prop_assert_eq!(value, restored);
+                }
             }
         }
     }

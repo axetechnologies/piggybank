@@ -188,7 +188,14 @@ fn handle_compress(state: &ServerState, args: &Value) -> Result<Value, String> {
         .ok_or("missing 'content' argument")?;
     let key = args.get("key").and_then(Value::as_str);
 
-    if let Ok(compressed) = boomerang_core::compress_json(content.as_bytes()) {
+    // The store-backed variant: JSON gets the same cross-call memory text
+    // already has via Session, but content-addressed rather than
+    // key-addressed - a repeated large value (a status endpoint's payload,
+    // a metadata object re-fetched unchanged) collapses to near-nothing the
+    // moment it's seen again, in ANY later call, not just under one key.
+    if let Ok(compressed) =
+        boomerang_core::compress_json_with_store(content.as_bytes(), &state.store)
+    {
         return Ok(json!({
             "compressed": String::from_utf8_lossy(&compressed),
             "kind": "json",
@@ -231,9 +238,14 @@ fn handle_decompress(state: &ServerState, args: &Value) -> Result<Value, String>
         .ok_or("missing 'kind' argument (one of: json, text, session)")?;
 
     let restored = match kind {
-        "json" => {
-            boomerang_core::decompress_json(compressed.as_bytes()).map_err(|e| e.to_string())?
-        }
+        // Must be the store-backed variant, matching handle_compress: a
+        // "json" view from this server may contain a cross-call reference
+        // (__boomerang_cref__) that plain decompress_json doesn't know how
+        // to resolve - it would pass it through unchanged as if it were
+        // ordinary data instead of erroring, which is exactly the kind of
+        // silent-wrong-output failure this project treats as a real bug.
+        "json" => boomerang_core::decompress_json_with_store(compressed.as_bytes(), &state.store)
+            .map_err(|e| e.to_string())?,
         "text" => boomerang_core::decompress_text(&state.store, compressed.as_bytes())
             .map_err(|e| e.to_string())?,
         "session" => state
