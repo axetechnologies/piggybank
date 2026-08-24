@@ -6,13 +6,20 @@
 //! MCP server: `initialize`, `tools/list`, `tools/call`, and silently
 //! ignoring notifications (messages with no `id`, which get no response).
 //!
-//! Three tools, deliberately named to mirror headroom's own MCP surface
-//! (`headroom_compress` / `_retrieve` / `_stats`) for a direct, same-shape
-//! comparison:
+//! Four tools. Three deliberately named to mirror headroom's own MCP
+//! surface (`headroom_compress` / `_retrieve` / `_stats`) for a direct,
+//! same-shape comparison, plus a fourth headroom's own surface doesn't
+//! expose — `boomerang_decompress`, full reconstruction rather than
+//! per-reference retrieval, since with three genuinely different marker
+//! schemes underneath, guessing which one produced a given view is a real
+//! footgun; the caller already has `kind` from `compress`, so it just asks
+//! for it back:
 //!
 //! - `boomerang_compress` — auto-detects JSON (lossless columnar) vs
 //!   text/logs (dedup + elision); pass `key` for session-aware diffing
 //!   against whatever was last compressed under that key.
+//! - `boomerang_decompress` — full reconstruction of a compressed view,
+//!   given the `kind` `compress` returned alongside it.
 //! - `boomerang_retrieve` — fetch the exact original bytes behind a
 //!   reference id embedded in a compressed view.
 //! - `boomerang_stats` — entry count and total bytes held in the store.
@@ -116,6 +123,18 @@ fn tool_defs() -> Value {
             }
         },
         {
+            "name": "boomerang_decompress",
+            "description": "Reconstruct the exact original content from a compressed view returned by boomerang_compress. Requires `kind` (the value boomerang_compress returned alongside `compressed`) since the three compressors use distinct, non-overlapping marker schemes and guessing which one produced a given view is unreliable in the general case - pass back what compress told you.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "compressed": { "type": "string", "description": "The compressed view text, exactly as returned by boomerang_compress." },
+                    "kind": { "type": "string", "description": "One of \"json\", \"text\", or \"session\" - the `kind` field from the matching boomerang_compress call." }
+                },
+                "required": ["compressed", "kind"]
+            }
+        },
+        {
             "name": "boomerang_retrieve",
             "description": "Fetch the exact original bytes behind a reference id embedded in a compressed view (e.g. the id inside a BOOMERANG:ELIDE:... marker). Nothing boomerang_compress writes to its store is ever discarded, so this always succeeds for a ref it actually returned.",
             "inputSchema": {
@@ -141,6 +160,7 @@ fn handle_tools_call(state: &ServerState, id: Value, request: &Value) -> Value {
 
     let result = match name {
         "boomerang_compress" => handle_compress(state, &arguments),
+        "boomerang_decompress" => handle_decompress(state, &arguments),
         "boomerang_retrieve" => handle_retrieve(state, &arguments),
         "boomerang_stats" => handle_stats(state),
         other => Err(format!("unknown tool: {other}")),
@@ -198,6 +218,36 @@ fn handle_compress(state: &ServerState, args: &Value) -> Result<Value, String> {
         "compressed": String::from_utf8_lossy(&compressed),
         "kind": kind,
     }))
+}
+
+fn handle_decompress(state: &ServerState, args: &Value) -> Result<Value, String> {
+    let compressed = args
+        .get("compressed")
+        .and_then(Value::as_str)
+        .ok_or("missing 'compressed' argument")?;
+    let kind = args
+        .get("kind")
+        .and_then(Value::as_str)
+        .ok_or("missing 'kind' argument (one of: json, text, session)")?;
+
+    let restored = match kind {
+        "json" => {
+            boomerang_core::decompress_json(compressed.as_bytes()).map_err(|e| e.to_string())?
+        }
+        "text" => boomerang_core::decompress_text(&state.store, compressed.as_bytes())
+            .map_err(|e| e.to_string())?,
+        "session" => state
+            .session
+            .decompress(compressed.as_bytes())
+            .map_err(|e| e.to_string())?,
+        other => {
+            return Err(format!(
+                "unknown kind: {other} (expected json, text, or session)"
+            ))
+        }
+    };
+
+    Ok(json!({ "content": String::from_utf8_lossy(&restored) }))
 }
 
 fn handle_retrieve(state: &ServerState, args: &Value) -> Result<Value, String> {
