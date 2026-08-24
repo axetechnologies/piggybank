@@ -1,0 +1,12 @@
+[package]
+name = "boomerang-cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "boomerang"
+path = "src/main.rs"
+
+[dependencies]
+boomerang-core = { path = "../boomerang-core" }
+serde_json = "1"

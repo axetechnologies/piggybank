@@ -1,0 +1,3 @@
+[workspace]
+members = ["crates/boomerang-core", "crates/boomerang-cli"]
+resolver = "2"
