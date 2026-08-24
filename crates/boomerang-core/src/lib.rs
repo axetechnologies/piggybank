@@ -3,6 +3,9 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::PathBuf;
 
+mod text;
+pub use text::{compress_text, decompress_text, TextOptions};
+
 /// Content-addressed blob store. Every write is keyed by the sha256 of its
 /// bytes, so writing the same content twice is a no-op and nothing already
 /// on disk is ever overwritten. This is the one primitive that makes
