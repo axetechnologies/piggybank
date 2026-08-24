@@ -1,0 +1,2176 @@
+commit b9e1a50005a9e64e6e87da5c7616ae031348f70e
+Author: James Lewis <james@virul.co>
+Date:   Mon Aug 24 09:10:36 2026 -0400
+
+    MCP stdio server: boomerang mcp serve
+    
+    Hand-rolled JSON-RPC 2.0 over stdio, no SDK, no async runtime - it's a
+    blocking read-line/dispatch/write-line loop, which is the entire MCP
+    stdio transport. Implements initialize, tools/list, tools/call, and
+    correctly drops notifications (messages with no id get no response,
+    per JSON-RPC).
+    
+    Three tools, named to mirror headroom's own MCP surface for a direct
+    comparison:
+      - boomerang_compress(content, key?) - auto-detects JSON (routes to
+        the lossless columnar compressor) vs text/logs (dedup+elision).
+        key enables session-aware diffing against whatever was last
+        compressed under that key.
+      - boomerang_retrieve(ref) - fetch exact original bytes for a
+        reference id embedded in a compressed view.
+      - boomerang_stats() - entries/bytes currently in the store.
+    
+    Added Store::stats() to boomerang-core (filters to sha256-hex-named
+    files so Session's .session.json sidecar doesn't get counted), tested.
+    
+    Verified against the actual protocol, not just unit tests: initialize
+    handshake, tools/list schema, and a full tools/call round trip - a
+    300-line log auto-routed to kind:text, compressed 14679 -> 1396 bytes,
+    then boomerang_retrieve (a separate MCP call) pulled back the exact
+    275 elided lines via its embedded ref.
+    
+    boomerang mcp serve [--store-dir <path>], defaults to
+    ~/.boomerang/store so a client-launched server has a stable persistent
+    location regardless of launch cwd.
+
+diff --git a/crates/boomerang-cli/src/main.rs b/crates/boomerang-cli/src/main.rs
+index f3b340c..3264e1e 100644
+--- a/crates/boomerang-cli/src/main.rs
++++ b/crates/boomerang-cli/src/main.rs
+@@ -1,3 +1,5 @@
++mod mcp;
++
+ use boomerang_core::{Session, Store, TextOptions};
+ use std::env;
+ use std::fs;
+@@ -13,6 +15,7 @@ fn main() -> ExitCode {
+         Some("decompress-log") => run_text(&args, false),
+         Some("compress-session") => run_session_compress(&args),
+         Some("decompress-session") => run_session_decompress(&args),
++        Some("mcp") if args.get(2).map(String::as_str) == Some("serve") => run_mcp_serve(&args),
+         _ => {
+             usage();
+             ExitCode::FAILURE
+@@ -27,6 +30,28 @@ fn usage() {
+     eprintln!("       boomerang <compress-log|decompress-log> <file> [store-dir]   # text/logs");
+     eprintln!("       boomerang compress-session <key> <file> [store-dir]          # diff vs. last seen under <key>");
+     eprintln!("       boomerang decompress-session <file> [store-dir]");
++    eprintln!("       boomerang mcp serve [--store-dir <path>]                     # MCP server over stdio");
++}
++
++fn run_mcp_serve(args: &[String]) -> ExitCode {
++    let store_dir = args
++        .iter()
++        .position(|a| a == "--store-dir")
++        .and_then(|i| args.get(i + 1).cloned())
++        .or_else(|| {
++            env::var("HOME")
++                .ok()
++                .map(|home| format!("{home}/.boomerang/store"))
++        })
++        .unwrap_or_else(|| ".boomerang-store".to_string());
++
++    match mcp::serve(&store_dir) {
++        Ok(()) => ExitCode::SUCCESS,
++        Err(e) => {
++            eprintln!("mcp server error: {e}");
++            ExitCode::FAILURE
++        }
++    }
+ }
+ 
+ /// Write bytes to stdout exactly as-is — no added newline, no UTF-8
+diff --git a/crates/boomerang-cli/src/mcp.rs b/crates/boomerang-cli/src/mcp.rs
+new file mode 100644
+index 0000000..1503dba
+--- /dev/null
++++ b/crates/boomerang-cli/src/mcp.rs
+@@ -0,0 +1,194 @@
++//! A hand-rolled MCP (Model Context Protocol) server over stdio.
++//!
++//! No SDK, no async runtime — MCP over stdio is newline-delimited JSON-RPC
++//! 2.0, so this is a blocking read-a-line/dispatch/write-a-line loop. That's
++//! the whole transport. Implements just enough of the protocol to be a real
++//! MCP server: `initialize`, `tools/list`, `tools/call`, and silently
++//! ignoring notifications (messages with no `id`, which get no response).
++//!
++//! Three tools, deliberately named to mirror headroom's own MCP surface
++//! (`headroom_compress` / `_retrieve` / `_stats`) for a direct, same-shape
++//! comparison:
++//!
++//! - `boomerang_compress` — auto-detects JSON (lossless columnar) vs
++//!   text/logs (dedup + elision); pass `key` for session-aware diffing
++//!   against whatever was last compressed under that key.
++//! - `boomerang_retrieve` — fetch the exact original bytes behind a
++//!   reference id embedded in a compressed view.
++//! - `boomerang_stats` — entry count and total bytes held in the store.
++
++use boomerang_core::{Session, Store, TextOptions};
++use serde_json::{json, Value};
++use std::io::{self, BufRead, Write};
++
++struct ServerState {
++    store: Store,
++    session: Session,
++}
++
++pub fn serve(store_dir: &str) -> io::Result<()> {
++    let state = ServerState {
++        store: Store::open(store_dir)?,
++        session: Session::open(store_dir)?,
++    };
++
++    let stdin = io::stdin();
++    let mut stdout = io::stdout();
++
++    for line in stdin.lock().lines() {
++        let line = line?;
++        if line.trim().is_empty() {
++            continue;
++        }
++        let Ok(request) = serde_json::from_str::<Value>(&line) else {
++            continue; // malformed line on a line-oriented transport: drop it, don't crash the server
++        };
++
++        // A message with no "id" is a notification (e.g.
++        // notifications/initialized) — per JSON-RPC, it gets no response.
++        let Some(id) = request.get("id").cloned() else {
++            continue;
++        };
++        let method = request.get("method").and_then(Value::as_str).unwrap_or("");
++
++        let response = match method {
++            "initialize" => ok(id, initialize_result()),
++            "tools/list" => ok(id, json!({ "tools": tool_defs() })),
++            "tools/call" => handle_tools_call(&state, id, &request),
++            other => err(id, -32601, &format!("method not found: {other}")),
++        };
++
++        writeln!(stdout, "{}", serde_json::to_string(&response)?)?;
++        stdout.flush()?;
++    }
++    Ok(())
++}
++
++fn ok(id: Value, result: Value) -> Value {
++    json!({ "jsonrpc": "2.0", "id": id, "result": result })
++}
++
++fn err(id: Value, code: i64, message: &str) -> Value {
++    json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
++}
++
++fn initialize_result() -> Value {
++    json!({
++        "protocolVersion": "2024-11-05",
++        "capabilities": { "tools": {} },
++        "serverInfo": { "name": "boomerang", "version": env!("CARGO_PKG_VERSION") },
++    })
++}
++
++fn tool_defs() -> Value {
++    json!([
++        {
++            "name": "boomerang_compress",
++            "description": "Compress content before it reaches an LLM. Auto-detects JSON (lossless columnar compression: repeated keys/values in arrays-of-objects amortized) vs text/logs (consecutive-line dedup + middle elision for large blocks, exact recovery via boomerang_retrieve). Pass `key` (e.g. a file path) to diff against whatever was last compressed under that same key in this session, instead of resending it in full.",
++            "inputSchema": {
++                "type": "object",
++                "properties": {
++                    "content": { "type": "string", "description": "The raw content to compress." },
++                    "key": { "type": "string", "description": "Optional stable identifier (e.g. a file path) for session-aware diffing." }
++                },
++                "required": ["content"]
++            }
++        },
++        {
++            "name": "boomerang_retrieve",
++            "description": "Fetch the exact original bytes behind a reference id embedded in a compressed view (e.g. the id inside a BOOMERANG:ELIDE:... marker). Nothing boomerang_compress writes to its store is ever discarded, so this always succeeds for a ref it actually returned.",
++            "inputSchema": {
++                "type": "object",
++                "properties": {
++                    "ref": { "type": "string", "description": "The content-store reference id (sha256 hex)." }
++                },
++                "required": ["ref"]
++            }
++        },
++        {
++            "name": "boomerang_stats",
++            "description": "Report how many entries and how many bytes are currently held in the content store.",
++            "inputSchema": { "type": "object", "properties": {} }
++        },
++    ])
++}
++
++fn handle_tools_call(state: &ServerState, id: Value, request: &Value) -> Value {
++    let params = request.get("params").cloned().unwrap_or(json!({}));
++    let name = params.get("name").and_then(Value::as_str).unwrap_or("");
++    let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
++
++    let result = match name {
++        "boomerang_compress" => handle_compress(state, &arguments),
++        "boomerang_retrieve" => handle_retrieve(state, &arguments),
++        "boomerang_stats" => handle_stats(state),
++        other => Err(format!("unknown tool: {other}")),
++    };
++
++    // MCP tool-level failures are a normal result with isError:true, not a
++    // JSON-RPC error — the JSON-RPC error object is reserved for protocol
++    // problems (unknown method, malformed request), not tool business logic.
++    match result {
++        Ok(value) => ok(
++            id,
++            json!({ "content": [{ "type": "text", "text": value.to_string() }] }),
++        ),
++        Err(message) => ok(
++            id,
++            json!({ "content": [{ "type": "text", "text": message }], "isError": true }),
++        ),
++    }
++}
++
++fn handle_compress(state: &ServerState, args: &Value) -> Result<Value, String> {
++    let content = args
++        .get("content")
++        .and_then(Value::as_str)
++        .ok_or("missing 'content' argument")?;
++    let key = args.get("key").and_then(Value::as_str);
++
++    if let Ok(compressed) = boomerang_core::compress_json(content.as_bytes()) {
++        return Ok(json!({
++            "compressed": String::from_utf8_lossy(&compressed),
++            "kind": "json",
++        }));
++    }
++
++    let (compressed, kind) = match key {
++        Some(k) => (
++            state
++                .session
++                .compress(k, content.as_bytes())
++                .map_err(|e| e.to_string())?,
++            "session",
++        ),
++        None => (
++            boomerang_core::compress_text(
++                &state.store,
++                content.as_bytes(),
++                &TextOptions::default(),
++            )
++            .map_err(|e| e.to_string())?,
++            "text",
++        ),
++    };
++
++    Ok(json!({
++        "compressed": String::from_utf8_lossy(&compressed),
++        "kind": kind,
++    }))
++}
++
++fn handle_retrieve(state: &ServerState, args: &Value) -> Result<Value, String> {
++    let reference = args
++        .get("ref")
++        .and_then(Value::as_str)
++        .ok_or("missing 'ref' argument")?;
++    let bytes = state.store.get(reference).map_err(|e| e.to_string())?;
++    Ok(json!({ "content": String::from_utf8_lossy(&bytes) }))
++}
++
++fn handle_stats(state: &ServerState) -> Result<Value, String> {
++    let stats = state.store.stats().map_err(|e| e.to_string())?;
++    Ok(json!({ "store_entries": stats.entries, "store_bytes": stats.bytes }))
++}
+diff --git a/crates/boomerang-core/src/lib.rs b/crates/boomerang-core/src/lib.rs
+index 2fe4014..54b7e57 100644
+--- a/crates/boomerang-core/src/lib.rs
++++ b/crates/boomerang-core/src/lib.rs
+@@ -37,6 +37,32 @@ impl Store {
+     pub fn get(&self, id: &str) -> std::io::Result<Vec<u8>> {
+         fs::read(self.root.join(id))
+     }
++
++    /// Count entries and total bytes actually held in the store. Filters to
++    /// files whose names look like our sha256-hex ids so sidecar files
++    /// living in the same directory (e.g. `Session`'s `.session.json`)
++    /// don't get counted as content.
++    pub fn stats(&self) -> std::io::Result<StoreStats> {
++        let mut entries = 0usize;
++        let mut bytes = 0u64;
++        for entry in fs::read_dir(&self.root)? {
++            let entry = entry?;
++            let name = entry.file_name();
++            let is_content_id = name
++                .to_str()
++                .is_some_and(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()));
++            if is_content_id && entry.file_type()?.is_file() {
++                entries += 1;
++                bytes += entry.metadata()?.len();
++            }
++        }
++        Ok(StoreStats { entries, bytes })
++    }
++}
++
++pub struct StoreStats {
++    pub entries: usize,
++    pub bytes: u64,
+ }
+ 
+ const TABLE_MARKER: &str = "__boomerang_table__";
+@@ -195,4 +221,19 @@ mod tests {
+         assert_eq!(store.get(&id1).unwrap(), b"hello world");
+         fs::remove_dir_all(&dir).ok();
+     }
++
++    #[test]
++    fn store_stats_counts_content_ignores_non_id_files() {
++        let dir = std::env::temp_dir().join(format!("boomerang-stats-test-{}", std::process::id()));
++        let store = Store::open(&dir).unwrap();
++        store.put(b"hello").unwrap();
++        store.put(b"world!!").unwrap();
++        store.put(b"hello").unwrap(); // dedup: same id as the first, not a third entry
++        fs::write(dir.join(".session.json"), b"{}").unwrap(); // sidecar, must be ignored
++
++        let stats = store.stats().unwrap();
++        assert_eq!(stats.entries, 2);
++        assert_eq!(stats.bytes, 5 + 7);
++        fs::remove_dir_all(&dir).ok();
++    }
+ }
+
+commit fe7adaf55dcbdcf82d164c81ed64349af4d3dc7f
+Author: James Lewis <james@virul.co>
+Date:   Mon Aug 24 08:58:56 2026 -0400
+
+    boomerang-core: Session — diff against what was last shown, per key
+    
+    session.rs: hand-rolled LCS line differ (textbook O(N*M) DP, not Myers -
+    documented as the one thing to swap if that ever matters) plus a Session
+    type that tracks, per caller-supplied key (e.g. a file path), the content
+    id of whatever was last compressed under that key.
+    
+      - First sight of a key: passthrough, nothing to diff against yet.
+      - Identical re-read: collapses to a single short reference marker.
+      - Changed: compact diff against the previous version, replayable via
+        decompress() against the stored old content to reconstruct the new
+        content exactly.
+    
+    Session::open() persists the key->id map to disk (.session.json next to
+    the store) so state survives process restarts - required for the CLI to
+    demonstrate this at all, since each invocation is a fresh process and an
+    in-memory-only Session would look like 'first sight' every single time.
+    Session::new() stays in-memory-only for embedding in a long-lived process
+    (e.g. the MCP server, next).
+    
+    Factored the PUA marker/strip_pua helpers out of text.rs into a shared
+    markers.rs so session.rs isn't duplicating them.
+    
+    Verified across separate CLI process invocations on a 200-line file:
+    first sight 6380/6380 bytes, identical re-read 90 bytes, one-line edit
+    238 vs 6400 bytes (96% smaller), decompression in a 4th separate process
+    byte-identical to the edited file (verified with cmp).
+    
+    Also: added CI (fmt/clippy -D warnings/test/release build on push+PR).
+
+diff --git a/crates/boomerang-cli/src/main.rs b/crates/boomerang-cli/src/main.rs
+index 88a59d5..f3b340c 100644
+--- a/crates/boomerang-cli/src/main.rs
++++ b/crates/boomerang-cli/src/main.rs
+@@ -1,4 +1,4 @@
+-use boomerang_core::{Store, TextOptions};
++use boomerang_core::{Session, Store, TextOptions};
+ use std::env;
+ use std::fs;
+ use std::io::{self, Write};
+@@ -11,6 +11,8 @@ fn main() -> ExitCode {
+         Some("decompress") => run_json(&args, boomerang_core::decompress_json),
+         Some("compress-log") => run_text(&args, true),
+         Some("decompress-log") => run_text(&args, false),
++        Some("compress-session") => run_session_compress(&args),
++        Some("decompress-session") => run_session_decompress(&args),
+         _ => {
+             usage();
+             ExitCode::FAILURE
+@@ -19,8 +21,12 @@ fn main() -> ExitCode {
+ }
+ 
+ fn usage() {
+-    eprintln!("usage: boomerang <compress|decompress> <file>            # JSON, lossless");
+-    eprintln!("       boomerang <compress-log|decompress-log> <file> [store-dir]  # text/logs");
++    eprintln!(
++        "usage: boomerang <compress|decompress> <file>                       # JSON, lossless"
++    );
++    eprintln!("       boomerang <compress-log|decompress-log> <file> [store-dir]   # text/logs");
++    eprintln!("       boomerang compress-session <key> <file> [store-dir]          # diff vs. last seen under <key>");
++    eprintln!("       boomerang decompress-session <file> [store-dir]");
+ }
+ 
+ /// Write bytes to stdout exactly as-is — no added newline, no UTF-8
+@@ -93,3 +99,73 @@ fn run_text(args: &[String], compressing: bool) -> ExitCode {
+         }
+     }
+ }
++
++fn run_session_compress(args: &[String]) -> ExitCode {
++    let (Some(key), Some(path)) = (args.get(2), args.get(3)) else {
++        usage();
++        return ExitCode::FAILURE;
++    };
++    let store_dir = args
++        .get(4)
++        .cloned()
++        .unwrap_or_else(|| ".boomerang-store".to_string());
++    let session = match Session::open(&store_dir) {
++        Ok(s) => s,
++        Err(e) => {
++            eprintln!("error opening session at {store_dir}: {e}");
++            return ExitCode::FAILURE;
++        }
++    };
++    let input = match fs::read(path) {
++        Ok(b) => b,
++        Err(e) => {
++            eprintln!("error reading {path}: {e}");
++            return ExitCode::FAILURE;
++        }
++    };
++    match session.compress(key, &input) {
++        Ok(output) => {
++            write_stdout(&output);
++            ExitCode::SUCCESS
++        }
++        Err(e) => {
++            eprintln!("error: {e}");
++            ExitCode::FAILURE
++        }
++    }
++}
++
++fn run_session_decompress(args: &[String]) -> ExitCode {
++    let Some(path) = args.get(2) else {
++        usage();
++        return ExitCode::FAILURE;
++    };
++    let store_dir = args
++        .get(3)
++        .cloned()
++        .unwrap_or_else(|| ".boomerang-store".to_string());
++    let session = match Session::open(&store_dir) {
++        Ok(s) => s,
++        Err(e) => {
++            eprintln!("error opening session at {store_dir}: {e}");
++            return ExitCode::FAILURE;
++        }
++    };
++    let input = match fs::read(path) {
++        Ok(b) => b,
++        Err(e) => {
++            eprintln!("error reading {path}: {e}");
++            return ExitCode::FAILURE;
++        }
++    };
++    match session.decompress(&input) {
++        Ok(output) => {
++            write_stdout(&output);
++            ExitCode::SUCCESS
++        }
++        Err(e) => {
++            eprintln!("error: {e}");
++            ExitCode::FAILURE
++        }
++    }
++}
+diff --git a/crates/boomerang-core/src/lib.rs b/crates/boomerang-core/src/lib.rs
+index 467c544..2fe4014 100644
+--- a/crates/boomerang-core/src/lib.rs
++++ b/crates/boomerang-core/src/lib.rs
+@@ -3,7 +3,10 @@ use sha2::{Digest, Sha256};
+ use std::fs;
+ use std::path::PathBuf;
+ 
++mod markers;
++mod session;
+ mod text;
++pub use session::Session;
+ pub use text::{compress_text, decompress_text, TextOptions};
+ 
+ /// Content-addressed blob store. Every write is keyed by the sha256 of its
+diff --git a/crates/boomerang-core/src/markers.rs b/crates/boomerang-core/src/markers.rs
+new file mode 100644
+index 0000000..7604e7e
+--- /dev/null
++++ b/crates/boomerang-core/src/markers.rs
+@@ -0,0 +1,15 @@
++/// Private-use-area sentinel used to delimit Boomerang's own control lines
++/// inside compressed text. Chosen because it essentially never appears in
++/// real logs/text/code, so control lines can't collide with content without
++/// needing an escaping scheme. A real limitation against adversarial input,
++/// not a cryptographic guarantee — acceptable for text this tool generates
++/// and re-parses itself.
++pub(crate) const PUA: char = '\u{E000}';
++
++pub(crate) fn strip_pua<'a>(line: &'a str, prefix: &str) -> Option<&'a str> {
++    let mut chars = line.chars();
++    if chars.next() != Some(PUA) {
++        return None;
++    }
++    chars.as_str().strip_prefix(prefix)?.strip_suffix(PUA)
++}
+diff --git a/crates/boomerang-core/src/session.rs b/crates/boomerang-core/src/session.rs
+new file mode 100644
+index 0000000..37ae834
+--- /dev/null
++++ b/crates/boomerang-core/src/session.rs
+@@ -0,0 +1,388 @@
++use crate::markers::{strip_pua, PUA};
++use crate::Store;
++use std::cell::RefCell;
++use std::collections::HashMap;
++use std::fs;
++use std::io::{self, Error, ErrorKind};
++use std::path::{Path, PathBuf};
++
++/// A session tracks, per logical key (typically a file path), the content
++/// id of whatever was last shown under that key. The next time the same
++/// key is compressed, only what changed is sent — a diff against the
++/// previous version, or nothing at all if it's byte-identical — instead of
++/// resending content an agent has already seen this session.
++///
++/// Keyed by a caller-supplied key rather than by content, so a renamed
++/// file with unchanged content is still recognized as unchanged *if the
++/// caller passes the new path* — recognizing that case for free (without
++/// the caller telling us) would need content-addressed lookup across all
++/// keys, which is a real extension but not needed for the common case of
++/// "the same file, re-read."
++pub struct Session {
++    store: Store,
++    last_seen: RefCell<HashMap<String, String>>,
++    state_path: Option<PathBuf>,
++}
++
++impl Session {
++    /// In-memory only — state does not survive past this `Session` value.
++    /// Fine for embedding in a single long-lived process (e.g. an MCP
++    /// server); not useful across separate CLI invocations, since each one
++    /// starts a fresh process. Use `open` for that.
++    pub fn new(store: Store) -> Self {
++        Self {
++            store,
++            last_seen: RefCell::new(HashMap::new()),
++            state_path: None,
++        }
++    }
++
++    /// Open a session whose per-key "last seen" state is persisted on disk
++    /// alongside the store, so it survives process restarts — including
++    /// separate CLI invocations, which is the only way a CLI can
++    /// meaningfully demonstrate diffing against a prior run at all.
++    pub fn open(store_dir: impl AsRef<Path>) -> io::Result<Self> {
++        let dir = store_dir.as_ref();
++        let store = Store::open(dir)?;
++        let state_path = dir.join(".session.json");
++        let last_seen = fs::read(&state_path)
++            .ok()
++            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
++            .unwrap_or_default();
++        Ok(Self {
++            store,
++            last_seen: RefCell::new(last_seen),
++            state_path: Some(state_path),
++        })
++    }
++
++    fn persist(&self) -> io::Result<()> {
++        let Some(path) = &self.state_path else {
++            return Ok(());
++        };
++        let bytes = serde_json::to_vec(&*self.last_seen.borrow())
++            .map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
++        fs::write(path, bytes)
++    }
++
++    /// Compress `content` under `key` relative to whatever this session
++    /// last saw under that same key.
++    ///
++    /// - First time this key is seen: content passes through unchanged
++    ///   (there's nothing to diff against yet) and gets recorded.
++    /// - Identical to last time: a single short "unchanged" marker.
++    /// - Changed: a compact diff against the previous version, which
++    ///   `decompress` can replay against the stored previous content to
++    ///   reconstruct the new content exactly.
++    pub fn compress(&self, key: &str, content: &[u8]) -> io::Result<Vec<u8>> {
++        let new_id = self.store.put(content)?;
++        let previous_id = self.last_seen.borrow().get(key).cloned();
++        self.last_seen
++            .borrow_mut()
++            .insert(key.to_string(), new_id.clone());
++        self.persist()?;
++
++        match previous_id {
++            None => Ok(content.to_vec()),
++            Some(prev_id) if prev_id == new_id => Ok(unchanged_marker(&prev_id).into_bytes()),
++            Some(prev_id) => {
++                let old_text = utf8(self.store.get(&prev_id)?)?;
++                let new_text = std::str::from_utf8(content)
++                    .map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
++                let old_lines: Vec<&str> = old_text.split('\n').collect();
++                let new_lines: Vec<&str> = new_text.split('\n').collect();
++                let ops = lcs_diff(&old_lines, &new_lines);
++                let mut out = diff_marker(&prev_id);
++                out.push('\n');
++                out.push_str(&format_diff(&ops));
++                Ok(out.into_bytes())
++            }
++        }
++    }
++
++    /// Reconstruct exactly what `compress` was given, using the same store
++    /// the session (or an equivalent one opened on the same directory) has
++    /// been writing to. Content with no recognized marker is assumed to be
++    /// first-sight passthrough and returned as-is.
++    pub fn decompress(&self, compressed: &[u8]) -> io::Result<Vec<u8>> {
++        let Ok(text) = std::str::from_utf8(compressed) else {
++            return Ok(compressed.to_vec());
++        };
++
++        if let Some(id) = strip_pua(text, "BOOMERANG:UNCHANGED:") {
++            return self.store.get(id);
++        }
++
++        if let Some((first, rest)) = text.split_once('\n') {
++            if let Some(prev_id) = strip_pua(first, "BOOMERANG:DIFF:") {
++                let old_text = utf8(self.store.get(prev_id)?)?;
++                let old_lines: Vec<&str> = old_text.split('\n').collect();
++                let ops = parse_diff(rest)
++                    .ok_or_else(|| Error::new(ErrorKind::InvalidData, "malformed diff"))?;
++                return Ok(apply_diff(&old_lines, &ops).join("\n").into_bytes());
++            }
++        }
++
++        Ok(compressed.to_vec())
++    }
++}
++
++fn utf8(bytes: Vec<u8>) -> io::Result<String> {
++    String::from_utf8(bytes).map_err(|e| Error::new(ErrorKind::InvalidData, e))
++}
++
++fn unchanged_marker(id: &str) -> String {
++    format!("{PUA}BOOMERANG:UNCHANGED:{id}{PUA}")
++}
++
++fn diff_marker(id: &str) -> String {
++    format!("{PUA}BOOMERANG:DIFF:{id}{PUA}")
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++enum DiffOp {
++    Same(usize),
++    Delete(usize),
++    Insert(Vec<String>),
++}
++
++/// Line-level diff via the textbook LCS dynamic-program: `dp[i][j]` is the
++/// length of the longest common subsequence of `old[i..]` and `new[j..]`.
++/// O(N*M) time and space — the simple, obviously-correct version, not the
++/// O(ND) Myers algorithm `git diff` actually uses. Fine for the file/log
++/// sizes an agent session deals with; if that ever stops being true, this
++/// is the one function that needs replacing, behind the same op-list
++/// interface.
++fn lcs_diff(old: &[&str], new: &[&str]) -> Vec<DiffOp> {
++    let (n, m) = (old.len(), new.len());
++    let mut dp = vec![vec![0usize; m + 1]; n + 1];
++    for i in (0..n).rev() {
++        for j in (0..m).rev() {
++            dp[i][j] = if old[i] == new[j] {
++                dp[i + 1][j + 1] + 1
++            } else {
++                dp[i + 1][j].max(dp[i][j + 1])
++            };
++        }
++    }
++
++    let mut ops: Vec<DiffOp> = Vec::new();
++    let (mut i, mut j) = (0, 0);
++    while i < n && j < m {
++        if old[i] == new[j] {
++            push_same(&mut ops);
++            i += 1;
++            j += 1;
++        } else if dp[i + 1][j] >= dp[i][j + 1] {
++            push_delete(&mut ops);
++            i += 1;
++        } else {
++            push_insert(&mut ops, new[j]);
++            j += 1;
++        }
++    }
++    while i < n {
++        push_delete(&mut ops);
++        i += 1;
++    }
++    while j < m {
++        push_insert(&mut ops, new[j]);
++        j += 1;
++    }
++    ops
++}
++
++fn push_same(ops: &mut Vec<DiffOp>) {
++    if let Some(DiffOp::Same(c)) = ops.last_mut() {
++        *c += 1;
++    } else {
++        ops.push(DiffOp::Same(1));
++    }
++}
++
++fn push_delete(ops: &mut Vec<DiffOp>) {
++    if let Some(DiffOp::Delete(c)) = ops.last_mut() {
++        *c += 1;
++    } else {
++        ops.push(DiffOp::Delete(1));
++    }
++}
++
++fn push_insert(ops: &mut Vec<DiffOp>, line: &str) {
++    if let Some(DiffOp::Insert(lines)) = ops.last_mut() {
++        lines.push(line.to_string());
++    } else {
++        ops.push(DiffOp::Insert(vec![line.to_string()]));
++    }
++}
++
++fn apply_diff(old: &[&str], ops: &[DiffOp]) -> Vec<String> {
++    let mut out = Vec::new();
++    let mut i = 0;
++    for op in ops {
++        match op {
++            DiffOp::Same(n) => {
++                out.extend(old[i..i + n].iter().map(|s| s.to_string()));
++                i += n;
++            }
++            DiffOp::Delete(n) => i += n,
++            DiffOp::Insert(lines) => out.extend(lines.iter().cloned()),
++        }
++    }
++    out
++}
++
++fn format_diff(ops: &[DiffOp]) -> String {
++    let mut out: Vec<String> = Vec::new();
++    for op in ops {
++        match op {
++            DiffOp::Same(n) => out.push(format!("{PUA}BOOMERANG:SAME:{n}{PUA}")),
++            DiffOp::Delete(n) => out.push(format!("{PUA}BOOMERANG:DELETE:{n}{PUA}")),
++            DiffOp::Insert(lines) => {
++                out.push(format!("{PUA}BOOMERANG:INSERT:{}{PUA}", lines.len()));
++                out.extend(lines.iter().cloned());
++            }
++        }
++    }
++    out.join("\n")
++}
++
++fn parse_diff(text: &str) -> Option<Vec<DiffOp>> {
++    let lines: Vec<&str> = text.split('\n').collect();
++    let mut ops = Vec::new();
++    let mut idx = 0;
++    while idx < lines.len() {
++        let line = lines[idx];
++        if let Some(n) = strip_pua(line, "BOOMERANG:SAME:").and_then(|s| s.parse().ok()) {
++            ops.push(DiffOp::Same(n));
++            idx += 1;
++        } else if let Some(n) = strip_pua(line, "BOOMERANG:DELETE:").and_then(|s| s.parse().ok()) {
++            ops.push(DiffOp::Delete(n));
++            idx += 1;
++        } else {
++            let n = strip_pua(line, "BOOMERANG:INSERT:").and_then(|s| s.parse::<usize>().ok())?;
++            idx += 1;
++            if idx + n > lines.len() {
++                return None;
++            }
++            let content: Vec<String> = lines[idx..idx + n].iter().map(|s| s.to_string()).collect();
++            ops.push(DiffOp::Insert(content));
++            idx += n;
++        }
++    }
++    Some(ops)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn temp_store() -> Store {
++        let dir = std::env::temp_dir().join(format!(
++            "boomerang-session-test-{:?}-{}",
++            std::time::SystemTime::now(),
++            std::process::id()
++        ));
++        Store::open(&dir).unwrap()
++    }
++
++    fn lines_of(s: &str) -> Vec<&str> {
++        s.split('\n').collect()
++    }
++
++    fn assert_diff_round_trips(old: &str, new: &str) {
++        let old_lines = lines_of(old);
++        let new_lines = lines_of(new);
++        let ops = lcs_diff(&old_lines, &new_lines);
++        let restored = apply_diff(&old_lines, &ops).join("\n");
++        assert_eq!(
++            restored, new,
++            "apply_diff(old, lcs_diff(old, new)) must equal new"
++        );
++
++        let formatted = format_diff(&ops);
++        let parsed = parse_diff(&formatted).expect("format_diff output must parse back");
++        assert_eq!(
++            parsed, ops,
++            "format_diff/parse_diff must round-trip the op list"
++        );
++    }
++
++    #[test]
++    fn lcs_diff_round_trips_various_shapes() {
++        assert_diff_round_trips("a\nb\nc", "a\nb\nc"); // identical
++        assert_diff_round_trips("a\nb\nc", "x\ny\nz"); // fully disjoint
++        assert_diff_round_trips("a\nb\nc", "a\nb\nnew\nc"); // pure insert
++        assert_diff_round_trips("a\nb\nc\nd", "a\nd"); // pure delete
++        assert_diff_round_trips("a\nb\nc", "a\nB\nc"); // single-line edit
++        assert_diff_round_trips("", "a\nb"); // empty old
++        assert_diff_round_trips("a\nb", ""); // empty new
++        assert_diff_round_trips("", ""); // both empty
++    }
++
++    #[test]
++    fn first_sight_of_a_key_passes_through_unchanged() {
++        let session = Session::new(temp_store());
++        let content = b"fn main() {}\n";
++        let compressed = session.compress("src/main.rs", content).unwrap();
++        assert_eq!(compressed, content, "nothing to diff against yet");
++        assert_eq!(session.decompress(&compressed).unwrap(), content);
++    }
++
++    #[test]
++    fn identical_reread_collapses_to_a_short_marker() {
++        let session = Session::new(temp_store());
++        let content: Vec<u8> = (0..200)
++            .map(|i| format!("line {i}\n"))
++            .collect::<String>()
++            .into_bytes();
++
++        let first = session.compress("src/big.rs", &content).unwrap();
++        assert_eq!(first, content);
++
++        let second = session.compress("src/big.rs", &content).unwrap();
++        assert!(
++            second.len() < content.len() / 10,
++            "unchanged re-read should collapse to a tiny marker: {} vs {}",
++            second.len(),
++            content.len()
++        );
++        assert_eq!(session.decompress(&second).unwrap(), content);
++    }
++
++    #[test]
++    fn small_edit_produces_a_small_diff_and_round_trips() {
++        let session = Session::new(temp_store());
++        let lines: Vec<String> = (0..200).map(|i| format!("line {i}")).collect();
++        let original = lines.join("\n");
++        session.compress("src/big.rs", original.as_bytes()).unwrap();
++
++        let mut edited_lines = lines.clone();
++        edited_lines[100] = "line 100 -- CHANGED".to_string();
++        let edited = edited_lines.join("\n");
++
++        let diff_view = session.compress("src/big.rs", edited.as_bytes()).unwrap();
++        assert!(
++            diff_view.len() < edited.len() / 4,
++            "one-line change in a 200-line file should compress far below the full file: {} vs {}",
++            diff_view.len(),
++            edited.len()
++        );
++
++        let restored = session.decompress(&diff_view).unwrap();
++        assert_eq!(
++            restored,
++            edited.into_bytes(),
++            "diff must reconstruct the edited content exactly"
++        );
++    }
++
++    #[test]
++    fn different_keys_are_independent() {
++        let session = Session::new(temp_store());
++        session.compress("a.rs", b"content a").unwrap();
++        // b.rs has never been seen -> passthrough, not a diff against a.rs.
++        let compressed = session.compress("b.rs", b"content b").unwrap();
++        assert_eq!(compressed, b"content b");
++    }
++}
+diff --git a/crates/boomerang-core/src/text.rs b/crates/boomerang-core/src/text.rs
+index 28d5ddf..fa327f4 100644
+--- a/crates/boomerang-core/src/text.rs
++++ b/crates/boomerang-core/src/text.rs
+@@ -1,13 +1,6 @@
++use crate::markers::{strip_pua, PUA};
+ use crate::Store;
+ 
+-/// Private-use-area sentinel used to delimit Boomerang's own control lines
+-/// inside compressed text. Chosen because it essentially never appears in
+-/// real logs/text, so control lines can't collide with content without
+-/// needing an escaping scheme. This is a real limitation against
+-/// adversarial input, not a cryptographic guarantee — acceptable for text
+-/// this tool generates and re-parses itself.
+-const PUA: char = '\u{E000}';
+-
+ #[derive(Clone, Copy)]
+ pub struct TextOptions {
+     /// Collapse a run of >= this many *consecutive* identical lines into
+@@ -168,14 +161,6 @@ fn parse_whole_document_elide(input: &[u8]) -> Option<String> {
+     parse_elide(text).map(|(_, id)| id)
+ }
+ 
+-fn strip_pua<'a>(line: &'a str, prefix: &str) -> Option<&'a str> {
+-    let mut chars = line.chars();
+-    if chars.next() != Some(PUA) {
+-        return None;
+-    }
+-    chars.as_str().strip_prefix(prefix)?.strip_suffix(PUA)
+-}
+-
+ fn count_lines_bytes(input: &[u8]) -> usize {
+     input.iter().filter(|&&b| b == b'\n').count() + 1
+ }
+
+commit 1d98d8b9a3550c0262ad0db07cd46bb5615f07b1
+Author: James Lewis <james@virul.co>
+Date:   Mon Aug 24 08:54:29 2026 -0400
+
+    add CI: fmt/clippy/test/release-build on every push and PR
+    
+    cargo fmt --check, clippy -D warnings, full test suite, release build,
+    running on push to main and on PRs. Applied cargo fmt to get to a clean
+    baseline before wiring it up.
+
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+new file mode 100644
+index 0000000..a66cc7b
+--- /dev/null
++++ b/.github/workflows/ci.yml
+@@ -0,0 +1,23 @@
++name: CI
++
++on:
++  push:
++    branches: [main]
++  pull_request:
++    branches: [main]
++
++jobs:
++  test:
++    runs-on: macos-14
++    steps:
++      - uses: actions/checkout@v4
++      - uses: dtolnay/rust-toolchain@stable
++      - uses: Swatinem/rust-cache@v2
++      - name: fmt check
++        run: cargo fmt --all -- --check
++      - name: clippy
++        run: cargo clippy --workspace --all-targets -- -D warnings
++      - name: test
++        run: cargo test --workspace
++      - name: build release
++        run: cargo build --workspace --release
+diff --git a/crates/boomerang-cli/src/main.rs b/crates/boomerang-cli/src/main.rs
+index 2b566f1..88a59d5 100644
+--- a/crates/boomerang-cli/src/main.rs
++++ b/crates/boomerang-cli/src/main.rs
+@@ -59,7 +59,10 @@ fn run_text(args: &[String], compressing: bool) -> ExitCode {
+         usage();
+         return ExitCode::FAILURE;
+     };
+-    let store_dir = args.get(3).cloned().unwrap_or_else(|| ".boomerang-store".to_string());
++    let store_dir = args
++        .get(3)
++        .cloned()
++        .unwrap_or_else(|| ".boomerang-store".to_string());
+     let store = match Store::open(&store_dir) {
+         Ok(s) => s,
+         Err(e) => {
+diff --git a/crates/boomerang-core/src/lib.rs b/crates/boomerang-core/src/lib.rs
+index e3d9e58..467c544 100644
+--- a/crates/boomerang-core/src/lib.rs
++++ b/crates/boomerang-core/src/lib.rs
+@@ -64,9 +64,11 @@ fn compress_value(value: &Value) -> Value {
+             Some(table) => table,
+             None => Value::Array(items.iter().map(compress_value).collect()),
+         },
+-        Value::Object(map) => {
+-            Value::Object(map.iter().map(|(k, v)| (k.clone(), compress_value(v))).collect())
+-        }
++        Value::Object(map) => Value::Object(
++            map.iter()
++                .map(|(k, v)| (k.clone(), compress_value(v)))
++                .collect(),
++        ),
+         other => other.clone(),
+     }
+ }
+@@ -102,8 +104,16 @@ fn columnarize(items: &[Value]) -> Option<Value> {
+ fn decompress_value(value: &Value) -> Value {
+     match value {
+         Value::Object(map) if map.get(TABLE_MARKER) == Some(&Value::Bool(true)) => {
+-            let keys = map.get("keys").and_then(Value::as_array).cloned().unwrap_or_default();
+-            let rows = map.get("rows").and_then(Value::as_array).cloned().unwrap_or_default();
++            let keys = map
++                .get("keys")
++                .and_then(Value::as_array)
++                .cloned()
++                .unwrap_or_default();
++            let rows = map
++                .get("rows")
++                .and_then(Value::as_array)
++                .cloned()
++                .unwrap_or_default();
+             let items = rows
+                 .into_iter()
+                 .map(|row| {
+@@ -111,7 +121,12 @@ fn decompress_value(value: &Value) -> Value {
+                     let obj: serde_json::Map<String, Value> = keys
+                         .iter()
+                         .zip(row)
+-                        .map(|(k, v)| (k.as_str().unwrap_or_default().to_string(), decompress_value(&v)))
++                        .map(|(k, v)| {
++                            (
++                                k.as_str().unwrap_or_default().to_string(),
++                                decompress_value(&v),
++                            )
++                        })
+                         .collect();
+                     Value::Object(obj)
+                 })
+@@ -119,9 +134,11 @@ fn decompress_value(value: &Value) -> Value {
+             Value::Array(items)
+         }
+         Value::Array(items) => Value::Array(items.iter().map(decompress_value).collect()),
+-        Value::Object(map) => {
+-            Value::Object(map.iter().map(|(k, v)| (k.clone(), decompress_value(v))).collect())
+-        }
++        Value::Object(map) => Value::Object(
++            map.iter()
++                .map(|(k, v)| (k.clone(), decompress_value(v)))
++                .collect(),
++        ),
+         other => other.clone(),
+     }
+ }
+@@ -148,7 +165,10 @@ mod tests {
+             {"id": 3, "status": "degraded", "region": "us-west"}
+         ]"#;
+         let compressed = compress_json(input.as_bytes()).unwrap();
+-        assert!(compressed.len() < input.len(), "table form should be smaller");
++        assert!(
++            compressed.len() < input.len(),
++            "table form should be smaller"
++        );
+         assert_round_trips(input);
+     }
+ 
+diff --git a/crates/boomerang-core/src/text.rs b/crates/boomerang-core/src/text.rs
+index 2e10659..28d5ddf 100644
+--- a/crates/boomerang-core/src/text.rs
++++ b/crates/boomerang-core/src/text.rs
+@@ -44,7 +44,10 @@ impl Default for TextOptions {
+ /// Non-UTF-8 input has no line structure to exploit, so it's stored whole
+ /// and handed back as a single elide marker rather than rejected.
+ pub fn compress_text(store: &Store, input: &[u8], opts: &TextOptions) -> std::io::Result<Vec<u8>> {
+-    debug_assert!(opts.dedup_min_repeat >= 2, "dedup_min_repeat < 2 collapses nothing");
++    debug_assert!(
++        opts.dedup_min_repeat >= 2,
++        "dedup_min_repeat < 2 collapses nothing"
++    );
+ 
+     let text = match std::str::from_utf8(input) {
+         Ok(t) => t,
+@@ -57,7 +60,9 @@ pub fn compress_text(store: &Store, input: &[u8], opts: &TextOptions) -> std::io
+     let lines: Vec<&str> = text.split('\n').collect();
+ 
+     if lines.len() <= opts.elide_threshold_lines {
+-        return Ok(dedup_lines(&lines, opts.dedup_min_repeat).join("\n").into_bytes());
++        return Ok(dedup_lines(&lines, opts.dedup_min_repeat)
++            .join("\n")
++            .into_bytes());
+     }
+ 
+     let keep_head = opts.keep_head.min(lines.len());
+@@ -191,7 +196,10 @@ mod tests {
+     fn assert_round_trips(store: &Store, input: &[u8], opts: &TextOptions) -> Vec<u8> {
+         let compressed = compress_text(store, input, opts).unwrap();
+         let restored = decompress_text(store, &compressed).unwrap();
+-        assert_eq!(restored, input, "decompress_text must reconstruct the original exactly");
++        assert_eq!(
++            restored, input,
++            "decompress_text must reconstruct the original exactly"
++        );
+         compressed
+     }
+ 
+@@ -199,9 +207,13 @@ mod tests {
+     fn small_input_round_trips_with_dedup_only() {
+         let store = temp_store();
+         let repeated = "ERROR: connection refused by upstream, retrying in 500ms";
+-        let input = format!("line one\n{repeated}\n{repeated}\n{repeated}\n{repeated}\nline five\n");
++        let input =
++            format!("line one\n{repeated}\n{repeated}\n{repeated}\n{repeated}\nline five\n");
+         let compressed = assert_round_trips(&store, input.as_bytes(), &TextOptions::default());
+-        assert!(compressed.len() < input.len(), "4x repeated line should shrink");
++        assert!(
++            compressed.len() < input.len(),
++            "4x repeated line should shrink"
++        );
+     }
+ 
+     #[test]
+@@ -211,7 +223,11 @@ mod tests {
+         let store = temp_store();
+         let input = "a\nx\nx\nx\nb\n";
+         let compressed = assert_round_trips(&store, input.as_bytes(), &TextOptions::default());
+-        assert_eq!(compressed, input.as_bytes(), "no-op when collapsing wouldn't shrink anything");
++        assert_eq!(
++            compressed,
++            input.as_bytes(),
++            "no-op when collapsing wouldn't shrink anything"
++        );
+     }
+ 
+     #[test]
+@@ -219,7 +235,9 @@ mod tests {
+         let store = temp_store();
+         let mut lines: Vec<String> = Vec::new();
+         for i in 0..500 {
+-            lines.push(format!("log line {i} some payload that takes up real space"));
++            lines.push(format!(
++                "log line {i} some payload that takes up real space"
++            ));
+         }
+         let input = lines.join("\n");
+ 
+
+commit 341985d66f22720b5ea77da3b57d4ecac72d8d9e
+Author: James Lewis <james@virul.co>
+Date:   Mon Aug 24 08:47:13 2026 -0400
+
+    boomerang-core: log/text compressor with lossy view + exact recovery
+    
+    compress_text/decompress_text: the first real use of Store for genuinely
+    lossy content.
+    
+      - Consecutive-line dedup: N identical lines in a row -> 1 line + a
+        repeat marker, but only when the marker overhead actually pays for
+        itself (short lines / low repeat counts are left literal).
+      - Middle elision past a line-count threshold: keep head+tail, store the
+        exact original middle span in Store, splice in a reference marker.
+    
+    decompress_text, given the same store, reconstructs the original exactly
+    - that's the property under test, not just 'looks similar'. Non-UTF-8
+    input is stored whole and handled as a single reference rather than
+    rejected.
+    
+    Wired into the CLI as compress-log/decompress-log. Fixed a CLI-only bug
+    along the way: println! was appending a stray newline on top of content
+    that already ended in one, breaking the on-disk round trip despite the
+    in-process assert_eq! round trip already passing - switched to raw
+    stdout writes.
+    
+    25732 -> 2129 bytes (91.7%) on a synthetic 300-line log with a repeated
+    FATAL burst, byte-identical after decompression (verified with cmp).
+
+diff --git a/crates/boomerang-cli/src/main.rs b/crates/boomerang-cli/src/main.rs
+index 3800715..2b566f1 100644
+--- a/crates/boomerang-cli/src/main.rs
++++ b/crates/boomerang-cli/src/main.rs
+@@ -1,22 +1,38 @@
++use boomerang_core::{Store, TextOptions};
+ use std::env;
+ use std::fs;
++use std::io::{self, Write};
+ use std::process::ExitCode;
+ 
+ fn main() -> ExitCode {
+     let args: Vec<String> = env::args().collect();
+     match args.get(1).map(String::as_str) {
+-        Some("compress") => run(&args, boomerang_core::compress_json),
+-        Some("decompress") => run(&args, boomerang_core::decompress_json),
++        Some("compress") => run_json(&args, boomerang_core::compress_json),
++        Some("decompress") => run_json(&args, boomerang_core::decompress_json),
++        Some("compress-log") => run_text(&args, true),
++        Some("decompress-log") => run_text(&args, false),
+         _ => {
+-            eprintln!("usage: boomerang <compress|decompress> <file>");
++            usage();
+             ExitCode::FAILURE
+         }
+     }
+ }
+ 
+-fn run(args: &[String], f: fn(&[u8]) -> serde_json::Result<Vec<u8>>) -> ExitCode {
++fn usage() {
++    eprintln!("usage: boomerang <compress|decompress> <file>            # JSON, lossless");
++    eprintln!("       boomerang <compress-log|decompress-log> <file> [store-dir]  # text/logs");
++}
++
++/// Write bytes to stdout exactly as-is — no added newline, no UTF-8
++/// re-encoding. `println!` would do both, and either one breaks the exact
++/// round-trip this whole tool exists to guarantee.
++fn write_stdout(bytes: &[u8]) {
++    io::stdout().write_all(bytes).expect("write to stdout");
++}
++
++fn run_json(args: &[String], f: fn(&[u8]) -> serde_json::Result<Vec<u8>>) -> ExitCode {
+     let Some(path) = args.get(2) else {
+-        eprintln!("usage: boomerang <compress|decompress> <file>");
++        usage();
+         return ExitCode::FAILURE;
+     };
+     let input = match fs::read(path) {
+@@ -28,7 +44,44 @@ fn run(args: &[String], f: fn(&[u8]) -> serde_json::Result<Vec<u8>>) -> ExitCode
+     };
+     match f(&input) {
+         Ok(output) => {
+-            println!("{}", String::from_utf8_lossy(&output));
++            write_stdout(&output);
++            ExitCode::SUCCESS
++        }
++        Err(e) => {
++            eprintln!("error: {e}");
++            ExitCode::FAILURE
++        }
++    }
++}
++
++fn run_text(args: &[String], compressing: bool) -> ExitCode {
++    let Some(path) = args.get(2) else {
++        usage();
++        return ExitCode::FAILURE;
++    };
++    let store_dir = args.get(3).cloned().unwrap_or_else(|| ".boomerang-store".to_string());
++    let store = match Store::open(&store_dir) {
++        Ok(s) => s,
++        Err(e) => {
++            eprintln!("error opening store {store_dir}: {e}");
++            return ExitCode::FAILURE;
++        }
++    };
++    let input = match fs::read(path) {
++        Ok(b) => b,
++        Err(e) => {
++            eprintln!("error reading {path}: {e}");
++            return ExitCode::FAILURE;
++        }
++    };
++    let result = if compressing {
++        boomerang_core::compress_text(&store, &input, &TextOptions::default())
++    } else {
++        boomerang_core::decompress_text(&store, &input)
++    };
++    match result {
++        Ok(output) => {
++            write_stdout(&output);
+             ExitCode::SUCCESS
+         }
+         Err(e) => {
+diff --git a/crates/boomerang-core/src/lib.rs b/crates/boomerang-core/src/lib.rs
+index 80d1c74..e3d9e58 100644
+--- a/crates/boomerang-core/src/lib.rs
++++ b/crates/boomerang-core/src/lib.rs
+@@ -3,6 +3,9 @@ use sha2::{Digest, Sha256};
+ use std::fs;
+ use std::path::PathBuf;
+ 
++mod text;
++pub use text::{compress_text, decompress_text, TextOptions};
++
+ /// Content-addressed blob store. Every write is keyed by the sha256 of its
+ /// bytes, so writing the same content twice is a no-op and nothing already
+ /// on disk is ever overwritten. This is the one primitive that makes
+diff --git a/crates/boomerang-core/src/text.rs b/crates/boomerang-core/src/text.rs
+new file mode 100644
+index 0000000..2e10659
+--- /dev/null
++++ b/crates/boomerang-core/src/text.rs
+@@ -0,0 +1,285 @@
++use crate::Store;
++
++/// Private-use-area sentinel used to delimit Boomerang's own control lines
++/// inside compressed text. Chosen because it essentially never appears in
++/// real logs/text, so control lines can't collide with content without
++/// needing an escaping scheme. This is a real limitation against
++/// adversarial input, not a cryptographic guarantee — acceptable for text
++/// this tool generates and re-parses itself.
++const PUA: char = '\u{E000}';
++
++#[derive(Clone, Copy)]
++pub struct TextOptions {
++    /// Collapse a run of >= this many *consecutive* identical lines into
++    /// one copy plus a repeat marker. Must be >= 2.
++    pub dedup_min_repeat: usize,
++    /// Above this many lines, elide the middle and keep only the ends.
++    pub elide_threshold_lines: usize,
++    pub keep_head: usize,
++    pub keep_tail: usize,
++}
++
++impl Default for TextOptions {
++    fn default() -> Self {
++        Self {
++            dedup_min_repeat: 3,
++            elide_threshold_lines: 60,
++            keep_head: 15,
++            keep_tail: 10,
++        }
++    }
++}
++
++/// Compress arbitrary text/log content via two independent, composable moves:
++///
++/// 1. **Consecutive-line dedup** — N identical lines in a row become one
++///    copy plus a "(repeated N times)" marker. Lossless on its own.
++/// 2. **Middle elision** — past `elide_threshold_lines`, keep the first
++///    `keep_head` and last `keep_tail` lines and replace everything between
++///    with a marker referencing the *exact original* middle span, stored in
++///    `store`. Lossy in the view an LLM sees, but `decompress_text` (given
++///    the same store) reconstructs it exactly — the guarantee is "nothing
++///    is gone," not "nothing is hidden."
++///
++/// Non-UTF-8 input has no line structure to exploit, so it's stored whole
++/// and handed back as a single elide marker rather than rejected.
++pub fn compress_text(store: &Store, input: &[u8], opts: &TextOptions) -> std::io::Result<Vec<u8>> {
++    debug_assert!(opts.dedup_min_repeat >= 2, "dedup_min_repeat < 2 collapses nothing");
++
++    let text = match std::str::from_utf8(input) {
++        Ok(t) => t,
++        Err(_) => {
++            let id = store.put(input)?;
++            return Ok(elide_marker(count_lines_bytes(input), &id).into_bytes());
++        }
++    };
++
++    let lines: Vec<&str> = text.split('\n').collect();
++
++    if lines.len() <= opts.elide_threshold_lines {
++        return Ok(dedup_lines(&lines, opts.dedup_min_repeat).join("\n").into_bytes());
++    }
++
++    let keep_head = opts.keep_head.min(lines.len());
++    let keep_tail = opts.keep_tail.min(lines.len() - keep_head);
++    let head = &lines[..keep_head];
++    let tail = &lines[lines.len() - keep_tail..];
++    let middle = &lines[keep_head..lines.len() - keep_tail];
++
++    let id = store.put(middle.join("\n").as_bytes())?;
++
++    let mut out = dedup_lines(head, opts.dedup_min_repeat);
++    out.push(elide_marker(middle.len(), &id));
++    out.extend(dedup_lines(tail, opts.dedup_min_repeat));
++    Ok(out.join("\n").into_bytes())
++}
++
++/// Reconstruct the original exactly, given the same `store` the content was
++/// compressed against. This is the reversible half of the guarantee: the
++/// LLM sees the smaller view from `compress_text`; anything that asks for
++/// the rest gets exactly what was elided, byte for byte.
++pub fn decompress_text(store: &Store, input: &[u8]) -> std::io::Result<Vec<u8>> {
++    if let Some(id) = parse_whole_document_elide(input) {
++        return store.get(&id);
++    }
++
++    let text = std::str::from_utf8(input)
++        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
++    let mut out: Vec<String> = Vec::new();
++
++    for line in text.split('\n') {
++        if let Some((_count, id)) = parse_elide(line) {
++            let restored = store.get(&id)?;
++            let restored = String::from_utf8(restored)
++                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
++            out.extend(restored.split('\n').map(str::to_string));
++        } else if let Some(count) = parse_repeat(line) {
++            let last = out.last().cloned().unwrap_or_default();
++            for _ in 1..count {
++                out.push(last.clone());
++            }
++        } else {
++            out.push(line.to_string());
++        }
++    }
++
++    Ok(out.join("\n").into_bytes())
++}
++
++fn dedup_lines(lines: &[&str], min_repeat: usize) -> Vec<String> {
++    let mut out = Vec::new();
++    let mut i = 0;
++    while i < lines.len() {
++        let line = lines[i];
++        let mut run = 1;
++        while i + run < lines.len() && lines[i + run] == line {
++            run += 1;
++        }
++        let marker = repeat_marker(run);
++        // Only collapse if it actually shrinks the output — marker overhead
++        // (~20+ bytes) can exceed the savings for short lines with few
++        // repeats, and applying a lossy rewrite that doesn't pay for itself
++        // is pure downside.
++        let collapsed_len = line.len() + 1 + marker.len();
++        let literal_len = (line.len() + 1) * run;
++        if run >= min_repeat && collapsed_len < literal_len {
++            out.push(line.to_string());
++            out.push(marker);
++        } else {
++            for _ in 0..run {
++                out.push(line.to_string());
++            }
++        }
++        i += run;
++    }
++    out
++}
++
++fn repeat_marker(count: usize) -> String {
++    format!("{PUA}BOOMERANG:REPEAT:{count}{PUA}")
++}
++
++fn elide_marker(line_count: usize, id: &str) -> String {
++    format!("{PUA}BOOMERANG:ELIDE:{line_count}:{id}{PUA}")
++}
++
++fn parse_repeat(line: &str) -> Option<usize> {
++    strip_pua(line, "BOOMERANG:REPEAT:")?.parse().ok()
++}
++
++fn parse_elide(line: &str) -> Option<(usize, String)> {
++    let body = strip_pua(line, "BOOMERANG:ELIDE:")?;
++    let (count, id) = body.split_once(':')?;
++    Some((count.parse().ok()?, id.to_string()))
++}
++
++/// If `input` is, in its entirety, exactly one elide marker (the whole
++/// document was replaced by a single reference — either because it wasn't
++/// UTF-8, or because keep_head/keep_tail elided everything), return the
++/// referenced id so the caller can hand back the raw stored bytes directly
++/// instead of running them through UTF-8 line parsing.
++fn parse_whole_document_elide(input: &[u8]) -> Option<String> {
++    let text = std::str::from_utf8(input).ok()?;
++    parse_elide(text).map(|(_, id)| id)
++}
++
++fn strip_pua<'a>(line: &'a str, prefix: &str) -> Option<&'a str> {
++    let mut chars = line.chars();
++    if chars.next() != Some(PUA) {
++        return None;
++    }
++    chars.as_str().strip_prefix(prefix)?.strip_suffix(PUA)
++}
++
++fn count_lines_bytes(input: &[u8]) -> usize {
++    input.iter().filter(|&&b| b == b'\n').count() + 1
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn temp_store() -> Store {
++        let dir = std::env::temp_dir().join(format!("boomerang-text-test-{}", uuid_ish()));
++        Store::open(&dir).unwrap()
++    }
++
++    fn uuid_ish() -> String {
++        format!("{:?}-{}", std::time::SystemTime::now(), std::process::id())
++    }
++
++    fn assert_round_trips(store: &Store, input: &[u8], opts: &TextOptions) -> Vec<u8> {
++        let compressed = compress_text(store, input, opts).unwrap();
++        let restored = decompress_text(store, &compressed).unwrap();
++        assert_eq!(restored, input, "decompress_text must reconstruct the original exactly");
++        compressed
++    }
++
++    #[test]
++    fn small_input_round_trips_with_dedup_only() {
++        let store = temp_store();
++        let repeated = "ERROR: connection refused by upstream, retrying in 500ms";
++        let input = format!("line one\n{repeated}\n{repeated}\n{repeated}\n{repeated}\nline five\n");
++        let compressed = assert_round_trips(&store, input.as_bytes(), &TextOptions::default());
++        assert!(compressed.len() < input.len(), "4x repeated line should shrink");
++    }
++
++    #[test]
++    fn short_repeated_line_that_would_not_pay_for_itself_is_left_literal() {
++        // Marker overhead exceeds the savings here (short line, few repeats) —
++        // the compressor must not apply a transform that grows the output.
++        let store = temp_store();
++        let input = "a\nx\nx\nx\nb\n";
++        let compressed = assert_round_trips(&store, input.as_bytes(), &TextOptions::default());
++        assert_eq!(compressed, input.as_bytes(), "no-op when collapsing wouldn't shrink anything");
++    }
++
++    #[test]
++    fn large_block_elides_and_still_round_trips() {
++        let store = temp_store();
++        let mut lines: Vec<String> = Vec::new();
++        for i in 0..500 {
++            lines.push(format!("log line {i} some payload that takes up real space"));
++        }
++        let input = lines.join("\n");
++
++        let compressed = assert_round_trips(&store, input.as_bytes(), &TextOptions::default());
++        assert!(
++            compressed.len() < input.len() / 5,
++            "elided view should be dramatically smaller: {} vs {}",
++            compressed.len(),
++            input.len()
++        );
++
++        // Prove it's actually eliding, not just re-embedding: a distinctive
++        // line from deep in the middle must not appear in the compressed view.
++        let compressed_text = String::from_utf8(compressed).unwrap();
++        assert!(!compressed_text.contains("log line 250"));
++    }
++
++    #[test]
++    fn non_utf8_input_round_trips_via_whole_document_store() {
++        let store = temp_store();
++        let input: &[u8] = &[0xff, 0xfe, 0x00, 0x01, 0xff, 0xff, 0x10];
++        assert_round_trips(&store, input, &TextOptions::default());
++    }
++
++    #[test]
++    fn repeated_block_inside_an_elided_middle_still_round_trips() {
++        let store = temp_store();
++        let mut lines: Vec<String> = Vec::new();
++        for _ in 0..300 {
++            lines.push("panic: same failure over and over".to_string());
++        }
++        let input = lines.join("\n");
++        assert_round_trips(&store, input.as_bytes(), &TextOptions::default());
++    }
++
++    #[test]
++    fn elided_content_is_exactly_recoverable_straight_from_the_store() {
++        let store = temp_store();
++        let mut lines: Vec<String> = Vec::new();
++        for i in 0..200 {
++            lines.push(format!("row {i}"));
++        }
++        let input = lines.join("\n");
++        let opts = TextOptions::default();
++        let compressed = compress_text(&store, input.as_bytes(), &opts).unwrap();
++
++        let compressed_text = String::from_utf8(compressed).unwrap();
++        let (_, id) = compressed_text
++            .split('\n')
++            .find_map(parse_elide)
++            .expect("expected an elide marker in a 200-line input");
++
++        let middle_lines: Vec<&str> = input.split('\n').collect();
++        let middle = &middle_lines[opts.keep_head..middle_lines.len() - opts.keep_tail];
++        assert_eq!(store.get(&id).unwrap(), middle.join("\n").into_bytes());
++    }
++
++    #[test]
++    fn empty_input_round_trips() {
++        let store = temp_store();
++        assert_round_trips(&store, b"", &TextOptions::default());
++    }
++}
+
+commit 29a53d6684a4b75aa52820188b77476d7f07bfe0
+Author: James Lewis <james@virul.co>
+Date:   Mon Aug 24 08:41:29 2026 -0400
+
+    boomerang-core: content-addressed Store + lossless JSON columnar compressor
+    
+    Store: sha256-keyed blob store on disk, dedups by content, nothing ever
+    overwritten. This is the primitive that makes compression reversible.
+    
+    compress_json/decompress_json: homogeneous arrays of objects become a
+    columnar table (keys once, rows of values) instead of repeating every
+    key per element. Fully lossless - proven by round-trip property tests,
+    not eyeballed. Doesn't touch Store yet; that's for the lossy log/diff
+    compressors that come next.
+    
+    boomerang-cli: minimal compress/decompress file CLI, no arg-parsing
+    framework, for exercising the core by hand.
+
+diff --git a/.gitignore b/.gitignore
+new file mode 100644
+index 0000000..ea8c4bf
+--- /dev/null
++++ b/.gitignore
+@@ -0,0 +1 @@
++/target
+diff --git a/Cargo.lock b/Cargo.lock
+new file mode 100644
+index 0000000..7189700
+--- /dev/null
++++ b/Cargo.lock
+@@ -0,0 +1,206 @@
++# This file is automatically @generated by Cargo.
++# It is not intended for manual editing.
++version = 4
++
++[[package]]
++name = "block-buffer"
++version = "0.10.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "3078c7629b62d3f0439517fa394996acacc5cbc91c5a20d8c658e77abd503a71"
++dependencies = [
++ "generic-array",
++]
++
++[[package]]
++name = "boomerang-cli"
++version = "0.1.0"
++dependencies = [
++ "boomerang-core",
++ "serde_json",
++]
++
++[[package]]
++name = "boomerang-core"
++version = "0.1.0"
++dependencies = [
++ "hex",
++ "serde",
++ "serde_json",
++ "sha2",
++]
++
++[[package]]
++name = "cfg-if"
++version = "1.0.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
++
++[[package]]
++name = "cpufeatures"
++version = "0.2.17"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "59ed5838eebb26a2bb2e58f6d5b5316989ae9d08bab10e0e6d103e656d1b0280"
++dependencies = [
++ "libc",
++]
++
++[[package]]
++name = "crypto-common"
++version = "0.1.7"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "78c8292055d1c1df0cce5d180393dc8cce0abec0a7102adb6c7b1eef6016d60a"
++dependencies = [
++ "generic-array",
++ "typenum",
++]
++
++[[package]]
++name = "digest"
++version = "0.10.7"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292"
++dependencies = [
++ "block-buffer",
++ "crypto-common",
++]
++
++[[package]]
++name = "generic-array"
++version = "0.14.7"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "85649ca51fd72272d7821adaf274ad91c288277713d9c18820d8499a7ff69e9a"
++dependencies = [
++ "typenum",
++ "version_check",
++]
++
++[[package]]
++name = "hex"
++version = "0.4.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
++
++[[package]]
++name = "itoa"
++version = "1.0.18"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
++
++[[package]]
++name = "libc"
++version = "0.2.189"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
++
++[[package]]
++name = "memchr"
++version = "2.8.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
++
++[[package]]
++name = "proc-macro2"
++version = "1.0.107"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
++dependencies = [
++ "unicode-ident",
++]
++
++[[package]]
++name = "quote"
++version = "1.0.47"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "1fbf4db142a473a8d80c26bbf18454ed458bf8d26c8219c331daecfdbd079001"
++dependencies = [
++ "proc-macro2",
++]
++
++[[package]]
++name = "serde"
++version = "1.0.229"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba"
++dependencies = [
++ "serde_core",
++ "serde_derive",
++]
++
++[[package]]
++name = "serde_core"
++version = "1.0.229"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "67dca2c9c51e58a4791a4b1ed58308b39c64224d349a935ab5039aa360942a48"
++dependencies = [
++ "serde_derive",
++]
++
++[[package]]
++name = "serde_derive"
++version = "1.0.229"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "e7a5d71263a5a7d47b41f6b3f06ba276f10cc18b0931f1799f710578e2309348"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn",
++]
++
++[[package]]
++name = "serde_json"
++version = "1.0.151"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "c841b55ecdae098c80dcae9cf767f6f8a0c2cdb3416bbef72181df4d0fe73f14"
++dependencies = [
++ "itoa",
++ "memchr",
++ "serde",
++ "serde_core",
++ "zmij",
++]
++
++[[package]]
++name = "sha2"
++version = "0.10.9"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283"
++dependencies = [
++ "cfg-if",
++ "cpufeatures",
++ "digest",
++]
++
++[[package]]
++name = "syn"
++version = "3.0.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "e6275cddf4610d1775e6d1fe9469b2e77d0f39fd98fb7450901b821e0c53649f"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "unicode-ident",
++]
++
++[[package]]
++name = "typenum"
++version = "1.20.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
++
++[[package]]
++name = "unicode-ident"
++version = "1.0.24"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
++
++[[package]]
++name = "version_check"
++version = "0.9.5"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
++
++[[package]]
++name = "zmij"
++version = "1.0.23"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
+diff --git a/Cargo.toml b/Cargo.toml
+new file mode 100644
+index 0000000..3c71ac8
+--- /dev/null
++++ b/Cargo.toml
+@@ -0,0 +1,3 @@
++[workspace]
++members = ["crates/boomerang-core", "crates/boomerang-cli"]
++resolver = "2"
+diff --git a/README.md b/README.md
+new file mode 100644
+index 0000000..6d5e990
+--- /dev/null
++++ b/README.md
+@@ -0,0 +1,77 @@
++# Boomerang
++
++Micro context-compression for AI agents. A much lighter, more robust take on
++[headroom](https://github.com/chopratejas/headroom): same core idea (shrink
++what an agent reads before it hits the LLM, never actually lose anything),
++built as a single static Rust binary instead of a Python package that pulls
++in `torch`+`transformers`.
++
++## Why this exists
++
++`headroom-ai`'s pipx venv broke because Homebrew retired the Python version
++it was pinned to — a rotted interpreter symlink took down an MCP server with
++one line in a config file. That's not a headroom-specific bug, it's what
++happens when a context-compression layer — something that sits between an
++agent and its own perception of the world — depends on a large, versioned
++runtime. Boomerang's answer: no interpreter, no downloaded model weights, no
++venv. One binary.
++
++## The name
++
++Headroom compresses; Boomerang returns. The mechanism this project is built
++around is content-addressed, reversible retrieval — nothing is ever deleted,
++only set aside, and it comes back the moment something asks for it by
++reference. A boomerang doesn't need to be fetched — it's already coming back.
++
++## Design
++
++Two primitives, nothing else load-bearing:
++
++1. **A view** — a smaller representation of a document.
++2. **Recovery** — the original, byte-for-byte, on demand, forever.
++
++Everything else (proxy, MCP server, per-agent wrappers) is product surface
++around those two. See [`crates/boomerang-core`](crates/boomerang-core) for
++the current state:
++
++- `Store` — a content-addressed blob store (`sha256(bytes) -> bytes` on
++  disk). Writing the same content twice is a no-op. This is what makes
++  compression reversible: a compressor never decides what's safe to discard,
++  because nothing it stores here is ever discarded.
++- `compress_json` / `decompress_json` — **lossless** structural compression.
++  Homogeneous arrays of objects (the shape of almost every API response or
++  tool-result list) become a columnar table: keys written once, then rows of
++  values, instead of repeating every key name per element. This alone
++  doesn't need `Store` at all — there's nothing to hold back for later,
++  because no information is lost.
++
++Not built yet, in order:
++
++- Log/text compressor (dedup repeated lines, elide-with-reference for large
++  blocks) — the first place `Store` actually gets used for something lossy.
++- Diff-against-session-cache for files an agent has already seen.
++- An MCP stdio server (`compress` / `retrieve` / `stats`) exposing all of
++  the above.
++- An HTTP proxy binary, sharing the same core crate.
++
++Explicitly *not* planned for v0: output-token compression (touching what the
++model writes, not just what it reads) and any ML-based prose compressor —
++both are correctness/complexity risks that the deterministic core doesn't
++need in order to capture most of the win.
++
++## The one invariant
++
++```
++retrieve(store.put(x)) == x
++```
++
++byte-for-byte, always. Tested as a hard property in
++`crates/boomerang-core/src/lib.rs`, not eyeballed.
++
++## Status
++
++Early scaffold. `boomerang-core` has `Store` and the JSON compressor with
++round-trip tests. `boomerang-cli` is a minimal `compress`/`decompress` file
++CLI for exercising the core by hand. No MCP server, no proxy, no benchmarks
++against headroom yet — see `benchmarks/` (not yet created) for that
++comparison once there's something worth measuring.
+diff --git a/crates/boomerang-cli/Cargo.toml b/crates/boomerang-cli/Cargo.toml
+new file mode 100644
+index 0000000..2af960f
+--- /dev/null
++++ b/crates/boomerang-cli/Cargo.toml
+@@ -0,0 +1,12 @@
++[package]
++name = "boomerang-cli"
++version = "0.1.0"
++edition = "2021"
++
++[[bin]]
++name = "boomerang"
++path = "src/main.rs"
++
++[dependencies]
++boomerang-core = { path = "../boomerang-core" }
++serde_json = "1"
+diff --git a/crates/boomerang-cli/src/main.rs b/crates/boomerang-cli/src/main.rs
+new file mode 100644
+index 0000000..3800715
+--- /dev/null
++++ b/crates/boomerang-cli/src/main.rs
+@@ -0,0 +1,39 @@
++use std::env;
++use std::fs;
++use std::process::ExitCode;
++
++fn main() -> ExitCode {
++    let args: Vec<String> = env::args().collect();
++    match args.get(1).map(String::as_str) {
++        Some("compress") => run(&args, boomerang_core::compress_json),
++        Some("decompress") => run(&args, boomerang_core::decompress_json),
++        _ => {
++            eprintln!("usage: boomerang <compress|decompress> <file>");
++            ExitCode::FAILURE
++        }
++    }
++}
++
++fn run(args: &[String], f: fn(&[u8]) -> serde_json::Result<Vec<u8>>) -> ExitCode {
++    let Some(path) = args.get(2) else {
++        eprintln!("usage: boomerang <compress|decompress> <file>");
++        return ExitCode::FAILURE;
++    };
++    let input = match fs::read(path) {
++        Ok(b) => b,
++        Err(e) => {
++            eprintln!("error reading {path}: {e}");
++            return ExitCode::FAILURE;
++        }
++    };
++    match f(&input) {
++        Ok(output) => {
++            println!("{}", String::from_utf8_lossy(&output));
++            ExitCode::SUCCESS
++        }
++        Err(e) => {
++            eprintln!("error: {e}");
++            ExitCode::FAILURE
++        }
++    }
++}
+diff --git a/crates/boomerang-core/Cargo.toml b/crates/boomerang-core/Cargo.toml
+new file mode 100644
+index 0000000..b724a80
+--- /dev/null
++++ b/crates/boomerang-core/Cargo.toml
+@@ -0,0 +1,10 @@
++[package]
++name = "boomerang-core"
++version = "0.1.0"
++edition = "2021"
++
++[dependencies]
++serde = { version = "1", features = ["derive"] }
++serde_json = "1"
++sha2 = "0.10"
++hex = "0.4"
+diff --git a/crates/boomerang-core/src/lib.rs b/crates/boomerang-core/src/lib.rs
+new file mode 100644
+index 0000000..80d1c74
+--- /dev/null
++++ b/crates/boomerang-core/src/lib.rs
+@@ -0,0 +1,172 @@
++use serde_json::Value;
++use sha2::{Digest, Sha256};
++use std::fs;
++use std::path::PathBuf;
++
++/// Content-addressed blob store. Every write is keyed by the sha256 of its
++/// bytes, so writing the same content twice is a no-op and nothing already
++/// on disk is ever overwritten. This is the one primitive that makes
++/// compression reversible: a compressor never has to decide what's safe to
++/// throw away, because nothing it stores here is ever thrown away.
++pub struct Store {
++    root: PathBuf,
++}
++
++impl Store {
++    pub fn open(root: impl Into<PathBuf>) -> std::io::Result<Self> {
++        let root = root.into();
++        fs::create_dir_all(&root)?;
++        Ok(Self { root })
++    }
++
++    pub fn put(&self, bytes: &[u8]) -> std::io::Result<String> {
++        let id = hex::encode(Sha256::digest(bytes));
++        let path = self.root.join(&id);
++        if !path.exists() {
++            fs::write(&path, bytes)?;
++        }
++        Ok(id)
++    }
++
++    pub fn get(&self, id: &str) -> std::io::Result<Vec<u8>> {
++        fs::read(self.root.join(id))
++    }
++}
++
++const TABLE_MARKER: &str = "__boomerang_table__";
++
++/// Compress JSON losslessly. Homogeneous arrays of objects — the shape of
++/// almost every API response or tool-result list — become a columnar
++/// table: keys written once, then rows of values, instead of repeating
++/// every key name once per element. Everything else compresses structurally
++/// (recursing into nested arrays/objects looking for tables to build).
++///
++/// This never calls into `Store`: JSON structural redundancy is removable
++/// without discarding any information, so there's nothing to hold back for
++/// later retrieval. `Store` exists for the lossy compressors (logs, diffs)
++/// that come after this.
++pub fn compress_json(input: &[u8]) -> serde_json::Result<Vec<u8>> {
++    let value: Value = serde_json::from_slice(input)?;
++    serde_json::to_vec(&compress_value(&value))
++}
++
++pub fn decompress_json(input: &[u8]) -> serde_json::Result<Vec<u8>> {
++    let value: Value = serde_json::from_slice(input)?;
++    serde_json::to_vec(&decompress_value(&value))
++}
++
++fn compress_value(value: &Value) -> Value {
++    match value {
++        Value::Array(items) if items.len() >= 2 => match columnarize(items) {
++            Some(table) => table,
++            None => Value::Array(items.iter().map(compress_value).collect()),
++        },
++        Value::Object(map) => {
++            Value::Object(map.iter().map(|(k, v)| (k.clone(), compress_value(v))).collect())
++        }
++        other => other.clone(),
++    }
++}
++
++/// Turn a homogeneous array of objects (identical key set on every element)
++/// into `{ "__boomerang_table__": true, "keys": [...], "rows": [[...], ...] }`.
++/// Returns `None` if the array isn't homogeneous — the caller falls back to
++/// compressing each element independently rather than forcing a bad fit.
++fn columnarize(items: &[Value]) -> Option<Value> {
++    let first_obj = items[0].as_object()?;
++    let keys: Vec<String> = first_obj.keys().cloned().collect();
++
++    let mut rows = Vec::with_capacity(items.len());
++    for item in items {
++        let obj = item.as_object()?;
++        if obj.len() != keys.len() {
++            return None;
++        }
++        let mut row = Vec::with_capacity(keys.len());
++        for k in &keys {
++            row.push(compress_value(obj.get(k)?));
++        }
++        rows.push(Value::Array(row));
++    }
++
++    Some(serde_json::json!({
++        TABLE_MARKER: true,
++        "keys": keys,
++        "rows": rows,
++    }))
++}
++
++fn decompress_value(value: &Value) -> Value {
++    match value {
++        Value::Object(map) if map.get(TABLE_MARKER) == Some(&Value::Bool(true)) => {
++            let keys = map.get("keys").and_then(Value::as_array).cloned().unwrap_or_default();
++            let rows = map.get("rows").and_then(Value::as_array).cloned().unwrap_or_default();
++            let items = rows
++                .into_iter()
++                .map(|row| {
++                    let row = row.as_array().cloned().unwrap_or_default();
++                    let obj: serde_json::Map<String, Value> = keys
++                        .iter()
++                        .zip(row)
++                        .map(|(k, v)| (k.as_str().unwrap_or_default().to_string(), decompress_value(&v)))
++                        .collect();
++                    Value::Object(obj)
++                })
++                .collect();
++            Value::Array(items)
++        }
++        Value::Array(items) => Value::Array(items.iter().map(decompress_value).collect()),
++        Value::Object(map) => {
++            Value::Object(map.iter().map(|(k, v)| (k.clone(), decompress_value(v))).collect())
++        }
++        other => other.clone(),
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// The one invariant that matters more than any compression ratio:
++    /// compress -> decompress must reproduce the exact same JSON value.
++    fn assert_round_trips(input: &str) {
++        let original: Value = serde_json::from_str(input).unwrap();
++        let compressed = compress_json(input.as_bytes()).unwrap();
++        let decompressed = decompress_json(&compressed).unwrap();
++        let restored: Value = serde_json::from_slice(&decompressed).unwrap();
++        assert_eq!(original, restored, "round-trip must be exact");
++    }
++
++    #[test]
++    fn homogeneous_array_round_trips_and_shrinks() {
++        let input = r#"[
++            {"id": 1, "status": "healthy", "region": "us-east"},
++            {"id": 2, "status": "healthy", "region": "us-east"},
++            {"id": 3, "status": "degraded", "region": "us-west"}
++        ]"#;
++        let compressed = compress_json(input.as_bytes()).unwrap();
++        assert!(compressed.len() < input.len(), "table form should be smaller");
++        assert_round_trips(input);
++    }
++
++    #[test]
++    fn heterogeneous_array_still_round_trips() {
++        assert_round_trips(r#"[{"a": 1}, {"b": 2, "c": 3}, "not an object"]"#);
++    }
++
++    #[test]
++    fn nested_object_round_trips() {
++        assert_round_trips(r#"{"meta": {"ok": true}, "items": [{"x": 1}, {"x": 2}]}"#);
++    }
++
++    #[test]
++    fn store_put_get_round_trips_and_dedupes() {
++        let dir = std::env::temp_dir().join(format!("boomerang-test-{}", std::process::id()));
++        let store = Store::open(&dir).unwrap();
++        let id1 = store.put(b"hello world").unwrap();
++        let id2 = store.put(b"hello world").unwrap(); // identical content -> identical id, no rewrite
++        assert_eq!(id1, id2);
++        assert_eq!(store.get(&id1).unwrap(), b"hello world");
++        fs::remove_dir_all(&dir).ok();
++    }
++}

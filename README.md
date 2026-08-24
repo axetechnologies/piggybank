@@ -44,15 +44,28 @@ the current state:
   values, instead of repeating every key name per element. This alone
   doesn't need `Store` at all — there's nothing to hold back for later,
   because no information is lost.
+- `compress_text` / `decompress_text` — dedup of consecutive repeated lines
+  (only when the collapse actually pays for itself) plus middle-elision past
+  a line-count threshold, with the elided span held in `Store` and recovered
+  exactly on retrieval.
+- `Session` — diffs against whatever was last compressed under a given key
+  (e.g. a file path): first sight passes through, an identical re-read
+  collapses to a short marker, a changed re-read gets a compact line diff
+  (a hand-rolled LCS differ) replayable against the stored previous version.
+  `Session::open` persists state to disk so it survives process restarts.
 
-Not built yet, in order:
+`boomerang mcp serve` ([`crates/boomerang-cli/src/mcp.rs`](crates/boomerang-cli/src/mcp.rs))
+exposes all of it over stdio as a hand-rolled MCP server — no SDK, no async
+runtime, just newline-delimited JSON-RPC — with three tools named to mirror
+headroom's own surface: `boomerang_compress`, `boomerang_retrieve`,
+`boomerang_stats`.
 
-- Log/text compressor (dedup repeated lines, elide-with-reference for large
-  blocks) — the first place `Store` actually gets used for something lossy.
-- Diff-against-session-cache for files an agent has already seen.
-- An MCP stdio server (`compress` / `retrieve` / `stats`) exposing all of
-  the above.
+Not built yet:
+
 - An HTTP proxy binary, sharing the same core crate.
+- Message-history awareness at the proxy/MCP layer (right now `Session`
+  diffs raw content by caller-supplied key; it doesn't yet auto-detect
+  conversation structure the way headroom's router does).
 
 Explicitly *not* planned for v0: output-token compression (touching what the
 model writes, not just what it reads) and any ML-based prose compressor —
@@ -70,8 +83,16 @@ byte-for-byte, always. Tested as a hard property in
 
 ## Status
 
-Early scaffold. `boomerang-core` has `Store` and the JSON compressor with
-round-trip tests. `boomerang-cli` is a minimal `compress`/`decompress` file
-CLI for exercising the core by hand. No MCP server, no proxy, no benchmarks
-against headroom yet — see `benchmarks/` (not yet created) for that
-comparison once there's something worth measuring.
+All three compressors (`Store`, JSON, text/log, `Session` diff) are built,
+tested (17 unit tests, all round-trip-verified), and exposed over a real MCP
+server (`boomerang mcp serve`), CI-checked on every push
+(fmt/clippy/test/release build). No HTTP proxy yet, no conversation-structure
+awareness at the MCP layer yet.
+
+See [`benchmarks/RESULTS.md`](benchmarks/RESULTS.md) for a real (not
+synthetic) comparison against headroom: boomerang wins decisively on
+structural/repetitive content (68–98% reduction on a build log and a git
+diff, 100–400x faster, zero warmup) and loses narrowly on a JSON case with
+mostly-unique per-row data, where headroom's ML-based semantic compressor
+found more to trim than structural dedup could. It's a mixed result, reported
+as one — see that file for the full analysis and its limitations.
