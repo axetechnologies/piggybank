@@ -1,4 +1,4 @@
-use crate::markers::{strip_pua, PUA};
+use crate::markers::{escape_lines, strip_pua, unescape_lines, PUA};
 use crate::Store;
 
 #[derive(Clone, Copy)]
@@ -35,7 +35,15 @@ impl Default for TextOptions {
 ///    is gone," not "nothing is hidden."
 ///
 /// Non-UTF-8 input has no line structure to exploit, so it's stored whole
-/// and handed back as a single elide marker rather than rejected.
+/// and handed back as a single raw-passthrough marker rather than rejected.
+///
+/// Every line is escaped (`escape_lines`) before any dedup/elision logic
+/// runs, and unescaped (`unescape_lines`) as the last step of decompression
+/// — see `markers.rs`. Without this, genuine input containing a line that
+/// happens to look like one of our own control markers (e.g. embedding a
+/// real store ref id) would decompress into unrelated content substituted
+/// in from wherever that id pointed — confirmed as a real bug, not a
+/// theoretical one, before this existed.
 pub fn compress_text(store: &Store, input: &[u8], opts: &TextOptions) -> std::io::Result<Vec<u8>> {
     debug_assert!(
         opts.dedup_min_repeat >= 2,
@@ -45,12 +53,15 @@ pub fn compress_text(store: &Store, input: &[u8], opts: &TextOptions) -> std::io
     let text = match std::str::from_utf8(input) {
         Ok(t) => t,
         Err(_) => {
+            // Raw bytes, never escaped (escaping is a text/line concept) —
+            // decompress_text's raw_marker check returns these untouched.
             let id = store.put(input)?;
-            return Ok(elide_marker(count_lines_bytes(input), &id).into_bytes());
+            return Ok(raw_marker(&id).into_bytes());
         }
     };
 
-    let lines: Vec<&str> = text.split('\n').collect();
+    let escaped = escape_lines(text);
+    let lines: Vec<&str> = escaped.split('\n').collect();
 
     if lines.len() <= opts.elide_threshold_lines {
         return Ok(dedup_lines(&lines, opts.dedup_min_repeat)
@@ -77,7 +88,10 @@ pub fn compress_text(store: &Store, input: &[u8], opts: &TextOptions) -> std::io
 /// LLM sees the smaller view from `compress_text`; anything that asks for
 /// the rest gets exactly what was elided, byte for byte.
 pub fn decompress_text(store: &Store, input: &[u8]) -> std::io::Result<Vec<u8>> {
-    if let Some(id) = parse_whole_document_elide(input) {
+    // The raw (non-UTF-8) fallback path is the only thing that ever
+    // produces this marker, and its content was never escaped — return it
+    // untouched, deliberately *not* running unescape_lines on it.
+    if let Some(id) = parse_raw_marker(input) {
         return store.get(&id);
     }
 
@@ -101,7 +115,7 @@ pub fn decompress_text(store: &Store, input: &[u8]) -> std::io::Result<Vec<u8>> 
         }
     }
 
-    Ok(out.join("\n").into_bytes())
+    Ok(unescape_lines(&out.join("\n")).into_bytes())
 }
 
 fn dedup_lines(lines: &[&str], min_repeat: usize) -> Vec<String> {
@@ -141,6 +155,18 @@ fn elide_marker(line_count: usize, id: &str) -> String {
     format!("{PUA}BOOMERANG:ELIDE:{line_count}:{id}{PUA}")
 }
 
+/// Distinct from `elide_marker` specifically so decompression can tell the
+/// two apart unambiguously. Both can end up as "the entire compressed
+/// document is one marker line" (raw: always; elide: only when custom
+/// keep_head=keep_tail=0), but only content behind an elide marker was ever
+/// escaped — content behind a raw marker (non-UTF-8 input) never was, and
+/// must never be run through unescape_lines. Reusing one marker for both
+/// and trying to infer which case applies from context is exactly the kind
+/// of ambiguity this whole file exists to avoid.
+fn raw_marker(id: &str) -> String {
+    format!("{PUA}BOOMERANG:RAW:{id}{PUA}")
+}
+
 fn parse_repeat(line: &str) -> Option<usize> {
     strip_pua(line, "BOOMERANG:REPEAT:")?.parse().ok()
 }
@@ -151,18 +177,9 @@ fn parse_elide(line: &str) -> Option<(usize, String)> {
     Some((count.parse().ok()?, id.to_string()))
 }
 
-/// If `input` is, in its entirety, exactly one elide marker (the whole
-/// document was replaced by a single reference — either because it wasn't
-/// UTF-8, or because keep_head/keep_tail elided everything), return the
-/// referenced id so the caller can hand back the raw stored bytes directly
-/// instead of running them through UTF-8 line parsing.
-fn parse_whole_document_elide(input: &[u8]) -> Option<String> {
+fn parse_raw_marker(input: &[u8]) -> Option<String> {
     let text = std::str::from_utf8(input).ok()?;
-    parse_elide(text).map(|(_, id)| id)
-}
-
-fn count_lines_bytes(input: &[u8]) -> usize {
-    input.iter().filter(|&&b| b == b'\n').count() + 1
+    strip_pua(text, "BOOMERANG:RAW:").map(str::to_string)
 }
 
 #[cfg(test)]
@@ -284,5 +301,51 @@ mod tests {
     fn empty_input_round_trips() {
         let store = temp_store();
         assert_round_trips(&store, b"", &TextOptions::default());
+    }
+
+    #[test]
+    fn input_containing_a_literal_marker_line_round_trips_and_does_not_leak() {
+        // Confirmed real bug before escape_lines/unescape_lines existed:
+        // this exact shape of input - a line that happens to look like a
+        // real ELIDE marker referencing a store id that genuinely exists
+        // (from unrelated prior content) - decompressed into that
+        // unrelated stored content being substituted in. Not just wrong
+        // output: a cross-content leak.
+        let store = temp_store();
+
+        let secret = "TOP SECRET content from a completely unrelated compression";
+        let mut filler: Vec<String> = (0..80).map(|i| format!("line {i}")).collect();
+        filler.insert(40, secret.to_string());
+        filler.extend((80..160).map(|i| format!("line {i}")));
+        let with_secret = filler.join("\n");
+        let compressed_with_secret =
+            compress_text(&store, with_secret.as_bytes(), &TextOptions::default()).unwrap();
+        let real_ref = String::from_utf8(compressed_with_secret)
+            .unwrap()
+            .lines()
+            .find_map(|l| parse_elide(l).map(|(_, id)| id))
+            .expect("expected an elide marker referencing the secret's storage");
+
+        let forged = format!(
+            "innocent line one\n{PUA}BOOMERANG:ELIDE:1:{real_ref}{PUA}\ninnocent line three"
+        );
+        let compressed = compress_text(&store, forged.as_bytes(), &TextOptions::default()).unwrap();
+        let restored = decompress_text(&store, &compressed).unwrap();
+        assert_eq!(
+            restored,
+            forged.into_bytes(),
+            "must reconstruct the literal forged-looking input, not substitute in the referenced secret"
+        );
+        assert!(
+            !String::from_utf8_lossy(&restored).contains("TOP SECRET"),
+            "must not leak unrelated stored content"
+        );
+    }
+
+    #[test]
+    fn already_escaped_looking_input_round_trips() {
+        let store = temp_store();
+        let input = format!("before\n{PUA}\u{E001}already escaped looking\nafter");
+        assert_round_trips(&store, input.as_bytes(), &TextOptions::default());
     }
 }

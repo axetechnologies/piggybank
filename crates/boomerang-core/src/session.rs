@@ -1,4 +1,4 @@
-use crate::markers::{strip_pua, PUA};
+use crate::markers::{escape_lines, strip_pua, unescape_lines, PUA};
 use crate::Store;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -74,6 +74,13 @@ impl Session {
     /// - Changed: a compact diff against the previous version, which
     ///   `decompress` can replay against the stored previous content to
     ///   reconstruct the new content exactly.
+    ///
+    /// The *view* returned here (not what's written to `store`, which is
+    /// always the raw original) is escaped line-by-line before it goes out,
+    /// and unescaped by `decompress` — see `markers::escape_lines`. Without
+    /// this, genuine content containing a line shaped like one of our own
+    /// SAME/DELETE/INSERT/UNCHANGED/DIFF markers would be misinterpreted on
+    /// the way back out, the same class of bug this closed in `text.rs`.
     pub fn compress(&self, key: &str, content: &[u8]) -> io::Result<Vec<u8>> {
         let new_id = self.store.put(content)?;
         let previous_id = self.last_seen.borrow().get(key).cloned();
@@ -83,14 +90,16 @@ impl Session {
         self.persist()?;
 
         match previous_id {
-            None => Ok(content.to_vec()),
+            None => Ok(escape_for_view(content)),
             Some(prev_id) if prev_id == new_id => Ok(unchanged_marker(&prev_id).into_bytes()),
             Some(prev_id) => {
                 let old_text = utf8(self.store.get(&prev_id)?)?;
                 let new_text = std::str::from_utf8(content)
                     .map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
-                let old_lines: Vec<&str> = old_text.split('\n').collect();
-                let new_lines: Vec<&str> = new_text.split('\n').collect();
+                let old_escaped = escape_lines(&old_text);
+                let new_escaped = escape_lines(new_text);
+                let old_lines: Vec<&str> = old_escaped.split('\n').collect();
+                let new_lines: Vec<&str> = new_escaped.split('\n').collect();
                 let ops = lcs_diff(&old_lines, &new_lines);
                 let mut out = diff_marker(&prev_id);
                 out.push('\n');
@@ -103,27 +112,43 @@ impl Session {
     /// Reconstruct exactly what `compress` was given, using the same store
     /// the session (or an equivalent one opened on the same directory) has
     /// been writing to. Content with no recognized marker is assumed to be
-    /// first-sight passthrough and returned as-is.
+    /// first-sight passthrough — unescaped and returned.
     pub fn decompress(&self, compressed: &[u8]) -> io::Result<Vec<u8>> {
         let Ok(text) = std::str::from_utf8(compressed) else {
             return Ok(compressed.to_vec());
         };
 
         if let Some(id) = strip_pua(text, "BOOMERANG:UNCHANGED:") {
+            // Store content is always raw/unescaped - nothing to undo.
             return self.store.get(id);
         }
 
         if let Some((first, rest)) = text.split_once('\n') {
             if let Some(prev_id) = strip_pua(first, "BOOMERANG:DIFF:") {
                 let old_text = utf8(self.store.get(prev_id)?)?;
-                let old_lines: Vec<&str> = old_text.split('\n').collect();
+                // Must match exactly what compress()'s diff branch built
+                // old_lines from, or the diff ops won't line up.
+                let old_escaped = escape_lines(&old_text);
+                let old_lines: Vec<&str> = old_escaped.split('\n').collect();
                 let ops = parse_diff(rest)
                     .ok_or_else(|| Error::new(ErrorKind::InvalidData, "malformed diff"))?;
-                return Ok(apply_diff(&old_lines, &ops).join("\n").into_bytes());
+                let reconstructed = apply_diff(&old_lines, &ops).join("\n");
+                return Ok(unescape_lines(&reconstructed).into_bytes());
             }
         }
 
-        Ok(compressed.to_vec())
+        Ok(unescape_lines(text).into_bytes())
+    }
+}
+
+/// Escape `content`'s lines for use as a compressed view, if it's UTF-8
+/// text; non-UTF-8 content has no line structure to exploit and passes
+/// through untouched (matches `decompress`'s own non-UTF-8 short-circuit,
+/// which never attempts to unescape it either).
+fn escape_for_view(content: &[u8]) -> Vec<u8> {
+    match std::str::from_utf8(content) {
+        Ok(text) => escape_lines(text).into_bytes(),
+        Err(_) => content.to_vec(),
     }
 }
 
@@ -384,5 +409,39 @@ mod tests {
         // b.rs has never been seen -> passthrough, not a diff against a.rs.
         let compressed = session.compress("b.rs", b"content b").unwrap();
         assert_eq!(compressed, b"content b");
+    }
+
+    #[test]
+    fn first_sight_content_that_looks_like_a_marker_round_trips() {
+        // First-sight passthrough is the case escape_for_view exists for:
+        // content that happens to look like one of our own markers must
+        // not be misinterpreted the next time it's decompressed.
+        let session = Session::new(temp_store());
+        let content = format!("real line\n{PUA}BOOMERANG:UNCHANGED:deadbeef{PUA}\nanother line");
+        let compressed = session.compress("weird.txt", content.as_bytes()).unwrap();
+        let restored = session.decompress(&compressed).unwrap();
+        assert_eq!(restored, content.into_bytes());
+    }
+
+    #[test]
+    fn diff_content_containing_marker_looking_lines_round_trips() {
+        // The new version introduces a line that looks like a SAME/DELETE
+        // marker - it ends up inside format_diff's output verbatim (as an
+        // Insert), and must not be misread as a real op on decompress.
+        let session = Session::new(temp_store());
+        let old = (0..20)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        session.compress("f.txt", old.as_bytes()).unwrap();
+
+        let mut new_lines: Vec<String> = (0..20).map(|i| format!("line {i}")).collect();
+        new_lines.insert(10, format!("{PUA}BOOMERANG:SAME:99{PUA}"));
+        new_lines.insert(15, format!("{PUA}BOOMERANG:DELETE:99{PUA}"));
+        let new = new_lines.join("\n");
+
+        let compressed = session.compress("f.txt", new.as_bytes()).unwrap();
+        let restored = session.decompress(&compressed).unwrap();
+        assert_eq!(restored, new.into_bytes());
     }
 }
