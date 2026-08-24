@@ -30,7 +30,22 @@ impl Store {
         let id = hex::encode(Sha256::digest(bytes));
         let path = self.root.join(&id);
         if !path.exists() {
-            fs::write(&path, bytes)?;
+            // fs::write alone isn't atomic - a process killed mid-write
+            // (OOM, crash, power loss) could leave a truncated file at
+            // `path` whose name (the content hash, computed from the
+            // intended bytes up front) no longer matches what's actually
+            // on disk, and nothing on read would ever detect that
+            // mismatch. Write to a temp file first, then atomically rename
+            // into place: a reader only ever sees either nothing or the
+            // complete, correct content, never a partial write. The temp
+            // name is namespaced by both the content id and this process's
+            // pid, so concurrent `put`s of the *same* content from
+            // different processes can't collide on the temp path, and
+            // whichever rename lands last still leaves matching content
+            // (same hash implies same bytes).
+            let tmp_path = self.root.join(format!("{id}.tmp.{}", std::process::id()));
+            fs::write(&tmp_path, bytes)?;
+            fs::rename(&tmp_path, &path)?;
         }
         Ok(id)
     }
@@ -93,6 +108,30 @@ mod tests {
         let stats = store.stats().unwrap();
         assert_eq!(stats.entries, 2);
         assert_eq!(stats.bytes, 5 + 7);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn put_leaves_no_orphaned_temp_file_and_content_is_readable_immediately() {
+        // put() now writes to a temp file and renames into place (fixed
+        // fs::write alone not being atomic - see put()'s doc comment).
+        // Confirms the happy path still leaves exactly the final file,
+        // nothing else, and get() sees it right away.
+        let dir =
+            std::env::temp_dir().join(format!("boomerang-atomic-test-{}", std::process::id()));
+        let store = Store::open(&dir).unwrap();
+        let id = store.put(b"atomic write check").unwrap();
+        assert_eq!(store.get(&id).unwrap(), b"atomic write check");
+
+        let entries: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            entries,
+            vec![id],
+            "no leftover .tmp file after a successful put"
+        );
         fs::remove_dir_all(&dir).ok();
     }
 }
