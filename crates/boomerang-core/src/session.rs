@@ -6,6 +6,15 @@ use std::fs;
 use std::io::{self, Error, ErrorKind};
 use std::path::{Path, PathBuf};
 
+/// Cap on `lcs_diff`'s DP table size ((old_lines+1)*(new_lines+1) usize
+/// cells) before `compress` gives up on diffing and falls back to sending
+/// full content instead. Measured, not guessed: 5,000x5,000 lines (25M
+/// cells) cost ~250MB peak RSS; 15,000x15,000 (225M cells) cost ~2GB. This
+/// cap (~16M cells) keeps worst-case memory in the ~150-250MB range while
+/// still covering the large majority of real files/tool output. Losing the
+/// diff on huge files costs compression ratio, never correctness.
+const MAX_DIFF_CELLS: u64 = 16_000_000;
+
 /// A session tracks, per logical key (typically a file path), the content
 /// id of whatever was last shown under that key. The next time the same
 /// key is compressed, only what changed is sent — a diff against the
@@ -100,6 +109,21 @@ impl Session {
                 let new_escaped = escape_lines(new_text);
                 let old_lines: Vec<&str> = old_escaped.split('\n').collect();
                 let new_lines: Vec<&str> = new_escaped.split('\n').collect();
+
+                // lcs_diff's DP table is (old_lines+1)*(new_lines+1) usize
+                // cells - a function of line *counts* only, not how similar
+                // the two versions are. A 15k-line file with a single
+                // changed line costs the same ~2GB as two maximally
+                // different 15k-line files, measured, not assumed. Past
+                // this cap, skip the diff and fall back to the always-safe,
+                // always-correct option: send the full (escaped) content,
+                // same as first sight. Costs the compression win on very
+                // large changed files; never costs correctness or risks OOM.
+                let cell_count = (old_lines.len() as u64 + 1) * (new_lines.len() as u64 + 1);
+                if cell_count > MAX_DIFF_CELLS {
+                    return Ok(escape_for_view(content));
+                }
+
                 let ops = lcs_diff(&old_lines, &new_lines);
                 let mut out = diff_marker(&prev_id);
                 out.push('\n');
@@ -441,6 +465,41 @@ mod tests {
         let new = new_lines.join("\n");
 
         let compressed = session.compress("f.txt", new.as_bytes()).unwrap();
+        let restored = session.decompress(&compressed).unwrap();
+        assert_eq!(restored, new.into_bytes());
+    }
+
+    #[test]
+    fn diff_above_the_cell_cap_falls_back_to_full_content_and_still_round_trips() {
+        // Confirmed by measurement (see MAX_DIFF_CELLS' doc comment) that
+        // lcs_diff's memory cost is a function of line counts alone, not
+        // similarity - a huge file with a single changed line costs the
+        // same as two huge maximally-different files. Pick line counts
+        // whose product clears the cap even though the content is nearly
+        // identical, and confirm compress() takes the safe fallback (no
+        // DIFF marker) rather than attempting the diff, while still
+        // reconstructing exactly.
+        let side = (MAX_DIFF_CELLS as f64).sqrt() as usize + 500;
+        let old_lines: Vec<String> = (0..side).map(|i| format!("line {i}")).collect();
+        let old = old_lines.join("\n");
+        let mut new_lines = old_lines.clone();
+        new_lines[side / 2] = "one changed line".to_string();
+        let new = new_lines.join("\n");
+
+        let session = Session::new(temp_store());
+        session.compress("big.txt", old.as_bytes()).unwrap();
+        let compressed = session.compress("big.txt", new.as_bytes()).unwrap();
+
+        let compressed_text = String::from_utf8(compressed.clone()).unwrap();
+        assert!(
+            strip_pua(
+                compressed_text.lines().next().unwrap_or(""),
+                "BOOMERANG:DIFF:"
+            )
+            .is_none(),
+            "must not have attempted a diff above the cell cap"
+        );
+
         let restored = session.decompress(&compressed).unwrap();
         assert_eq!(restored, new.into_bytes());
     }
