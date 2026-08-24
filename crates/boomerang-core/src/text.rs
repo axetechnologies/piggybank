@@ -44,7 +44,10 @@ impl Default for TextOptions {
 /// Non-UTF-8 input has no line structure to exploit, so it's stored whole
 /// and handed back as a single elide marker rather than rejected.
 pub fn compress_text(store: &Store, input: &[u8], opts: &TextOptions) -> std::io::Result<Vec<u8>> {
-    debug_assert!(opts.dedup_min_repeat >= 2, "dedup_min_repeat < 2 collapses nothing");
+    debug_assert!(
+        opts.dedup_min_repeat >= 2,
+        "dedup_min_repeat < 2 collapses nothing"
+    );
 
     let text = match std::str::from_utf8(input) {
         Ok(t) => t,
@@ -57,7 +60,9 @@ pub fn compress_text(store: &Store, input: &[u8], opts: &TextOptions) -> std::io
     let lines: Vec<&str> = text.split('\n').collect();
 
     if lines.len() <= opts.elide_threshold_lines {
-        return Ok(dedup_lines(&lines, opts.dedup_min_repeat).join("\n").into_bytes());
+        return Ok(dedup_lines(&lines, opts.dedup_min_repeat)
+            .join("\n")
+            .into_bytes());
     }
 
     let keep_head = opts.keep_head.min(lines.len());
@@ -191,7 +196,10 @@ mod tests {
     fn assert_round_trips(store: &Store, input: &[u8], opts: &TextOptions) -> Vec<u8> {
         let compressed = compress_text(store, input, opts).unwrap();
         let restored = decompress_text(store, &compressed).unwrap();
-        assert_eq!(restored, input, "decompress_text must reconstruct the original exactly");
+        assert_eq!(
+            restored, input,
+            "decompress_text must reconstruct the original exactly"
+        );
         compressed
     }
 
@@ -199,9 +207,13 @@ mod tests {
     fn small_input_round_trips_with_dedup_only() {
         let store = temp_store();
         let repeated = "ERROR: connection refused by upstream, retrying in 500ms";
-        let input = format!("line one\n{repeated}\n{repeated}\n{repeated}\n{repeated}\nline five\n");
+        let input =
+            format!("line one\n{repeated}\n{repeated}\n{repeated}\n{repeated}\nline five\n");
         let compressed = assert_round_trips(&store, input.as_bytes(), &TextOptions::default());
-        assert!(compressed.len() < input.len(), "4x repeated line should shrink");
+        assert!(
+            compressed.len() < input.len(),
+            "4x repeated line should shrink"
+        );
     }
 
     #[test]
@@ -211,7 +223,11 @@ mod tests {
         let store = temp_store();
         let input = "a\nx\nx\nx\nb\n";
         let compressed = assert_round_trips(&store, input.as_bytes(), &TextOptions::default());
-        assert_eq!(compressed, input.as_bytes(), "no-op when collapsing wouldn't shrink anything");
+        assert_eq!(
+            compressed,
+            input.as_bytes(),
+            "no-op when collapsing wouldn't shrink anything"
+        );
     }
 
     #[test]
@@ -219,7 +235,9 @@ mod tests {
         let store = temp_store();
         let mut lines: Vec<String> = Vec::new();
         for i in 0..500 {
-            lines.push(format!("log line {i} some payload that takes up real space"));
+            lines.push(format!(
+                "log line {i} some payload that takes up real space"
+            ));
         }
         let input = lines.join("\n");
 

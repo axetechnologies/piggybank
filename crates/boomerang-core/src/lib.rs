@@ -64,9 +64,11 @@ fn compress_value(value: &Value) -> Value {
             Some(table) => table,
             None => Value::Array(items.iter().map(compress_value).collect()),
         },
-        Value::Object(map) => {
-            Value::Object(map.iter().map(|(k, v)| (k.clone(), compress_value(v))).collect())
-        }
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(k, v)| (k.clone(), compress_value(v)))
+                .collect(),
+        ),
         other => other.clone(),
     }
 }
@@ -102,8 +104,16 @@ fn columnarize(items: &[Value]) -> Option<Value> {
 fn decompress_value(value: &Value) -> Value {
     match value {
         Value::Object(map) if map.get(TABLE_MARKER) == Some(&Value::Bool(true)) => {
-            let keys = map.get("keys").and_then(Value::as_array).cloned().unwrap_or_default();
-            let rows = map.get("rows").and_then(Value::as_array).cloned().unwrap_or_default();
+            let keys = map
+                .get("keys")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let rows = map
+                .get("rows")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
             let items = rows
                 .into_iter()
                 .map(|row| {
@@ -111,7 +121,12 @@ fn decompress_value(value: &Value) -> Value {
                     let obj: serde_json::Map<String, Value> = keys
                         .iter()
                         .zip(row)
-                        .map(|(k, v)| (k.as_str().unwrap_or_default().to_string(), decompress_value(&v)))
+                        .map(|(k, v)| {
+                            (
+                                k.as_str().unwrap_or_default().to_string(),
+                                decompress_value(&v),
+                            )
+                        })
                         .collect();
                     Value::Object(obj)
                 })
@@ -119,9 +134,11 @@ fn decompress_value(value: &Value) -> Value {
             Value::Array(items)
         }
         Value::Array(items) => Value::Array(items.iter().map(decompress_value).collect()),
-        Value::Object(map) => {
-            Value::Object(map.iter().map(|(k, v)| (k.clone(), decompress_value(v))).collect())
-        }
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(k, v)| (k.clone(), decompress_value(v)))
+                .collect(),
+        ),
         other => other.clone(),
     }
 }
@@ -148,7 +165,10 @@ mod tests {
             {"id": 3, "status": "degraded", "region": "us-west"}
         ]"#;
         let compressed = compress_json(input.as_bytes()).unwrap();
-        assert!(compressed.len() < input.len(), "table form should be smaller");
+        assert!(
+            compressed.len() < input.len(),
+            "table form should be smaller"
+        );
         assert_round_trips(input);
     }
 

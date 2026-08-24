@@ -59,7 +59,10 @@ fn run_text(args: &[String], compressing: bool) -> ExitCode {
         usage();
         return ExitCode::FAILURE;
     };
-    let store_dir = args.get(3).cloned().unwrap_or_else(|| ".boomerang-store".to_string());
+    let store_dir = args
+        .get(3)
+        .cloned()
+        .unwrap_or_else(|| ".boomerang-store".to_string());
     let store = match Store::open(&store_dir) {
         Ok(s) => s,
         Err(e) => {
