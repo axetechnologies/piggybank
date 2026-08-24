@@ -4,8 +4,9 @@ Micro context-compression for AI agents. A much lighter, more robust take on
 [headroom](https://github.com/chopratejas/headroom): same core idea (shrink
 what an agent reads before it hits the LLM, never actually lose anything),
 built as a single self-contained Rust binary instead of a Python package that
-pulls in `torch`+`transformers`. Measured, not asserted: 804KB release binary,
-sub-5ms cold start, only linked against the OS's own `libSystem` on macOS —
+pulls in `torch`+`transformers`. Measured, not asserted: 426KB release binary
+(size-tuned release profile: LTO, single codegen unit, stripped), sub-5ms
+cold start, only linked against the OS's own `libSystem` on macOS —
 on Linux with a musl target it's genuinely fully static. "Static" isn't quite
 the right word on macOS specifically (Apple doesn't support fully static
 linking there at all — even `libSystem` is always dynamic), so what actually
@@ -68,9 +69,12 @@ the current state:
 
 `boomerang mcp serve` ([`crates/boomerang-cli/src/mcp.rs`](crates/boomerang-cli/src/mcp.rs))
 exposes all of it over stdio as a hand-rolled MCP server — no SDK, no async
-runtime, just newline-delimited JSON-RPC — with three tools named to mirror
-headroom's own surface: `boomerang_compress`, `boomerang_retrieve`,
-`boomerang_stats`.
+runtime, just newline-delimited JSON-RPC. Four tools: three named to mirror
+headroom's own surface (`boomerang_compress`, `boomerang_retrieve`,
+`boomerang_stats`), plus `boomerang_decompress` — full reconstruction of a
+compressed view given the `kind` `compress` returned, which headroom's
+surface doesn't expose and which session-mode compression genuinely needs
+(there's no other way to get the diffed-and-reassembled new content back).
 
 Not built yet:
 
