@@ -4,6 +4,23 @@ use std::collections::HashMap;
 const TABLE_MARKER: &str = "__boomerang_table__";
 const INTERN_MARKER: &str = "__boomerang_intern__";
 const REF_MARKER: &str = "__boomerang_ref__";
+/// General namespace all three markers above live under. Any object key in
+/// genuine *input* data that happens to start with this gets escaped before
+/// compression (see `escape_reserved_keys`) so it can never be mistaken for
+/// a marker we generated — without this, input containing e.g. a literal
+/// `"__boomerang_table__": true` key would silently decompress to the wrong
+/// value, since decompress_value can't tell "ours" from "coincidentally
+/// identical." Confirmed as a real bug before this fix existed, not a
+/// theoretical one.
+const RESERVED_NAMESPACE: &str = "__boomerang_";
+/// Escape prefix added to any pre-existing key starting with
+/// `RESERVED_NAMESPACE`. Deliberately itself starts with
+/// `RESERVED_NAMESPACE`, which is what makes the scheme handle "the input
+/// already has a key that looks escaped" correctly: encoding always adds
+/// exactly one layer, decoding always removes exactly one, so it's a clean
+/// bijection regardless of how many `__boomerang_`-looking layers the
+/// original key already had.
+const ESCAPE_PREFIX: &str = "__boomerang_esc_";
 
 /// Below this serialized length, a subtree is never worth interning — the
 /// `{"__boomerang_ref__":N}` marker itself costs ~20+ bytes, so replacing
@@ -44,7 +61,8 @@ const MIN_INTERN_LEN: usize = 32;
 /// not information loss, so there's nothing to hold back for retrieval.
 pub fn compress_json(input: &[u8]) -> serde_json::Result<Vec<u8>> {
     let value: Value = serde_json::from_slice(input)?;
-    let columnarized = compress_value(&value);
+    let escaped = escape_reserved_keys(&value);
+    let columnarized = compress_value(&escaped);
     let interned = intern_value(&columnarized);
     serde_json::to_vec(&interned)
 }
@@ -53,7 +71,51 @@ pub fn decompress_json(input: &[u8]) -> serde_json::Result<Vec<u8>> {
     let value: Value = serde_json::from_slice(input)?;
     let uninterned = unintern_value(&value);
     let restored = decompress_value(&uninterned);
-    serde_json::to_vec(&restored)
+    let unescaped = unescape_reserved_keys(&restored);
+    serde_json::to_vec(&unescaped)
+}
+
+/// Rename any object key starting with `RESERVED_NAMESPACE` by prepending
+/// `ESCAPE_PREFIX`, recursively, everywhere in the tree. Runs before
+/// columnarize/intern so those passes only ever see a tree where the
+/// reserved namespace is exclusively ours. A no-op (and free) for the vast
+/// majority of real JSON, which never touches this namespace.
+fn escape_reserved_keys(value: &Value) -> Value {
+    match value {
+        Value::Array(items) => Value::Array(items.iter().map(escape_reserved_keys).collect()),
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(k, v)| {
+                    let key = if k.starts_with(RESERVED_NAMESPACE) {
+                        format!("{ESCAPE_PREFIX}{k}")
+                    } else {
+                        k.clone()
+                    };
+                    (key, escape_reserved_keys(v))
+                })
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// Reverses `escape_reserved_keys` exactly. Runs after decompress_value has
+/// already resolved every real marker, so any key still carrying
+/// `ESCAPE_PREFIX` at this point was added by escape_reserved_keys and
+/// nothing else — safe to strip unconditionally.
+fn unescape_reserved_keys(value: &Value) -> Value {
+    match value {
+        Value::Array(items) => Value::Array(items.iter().map(unescape_reserved_keys).collect()),
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(k, v)| {
+                    let key = k.strip_prefix(ESCAPE_PREFIX).unwrap_or(k).to_string();
+                    (key, unescape_reserved_keys(v))
+                })
+                .collect(),
+        ),
+        other => other.clone(),
+    }
 }
 
 fn compress_value(value: &Value) -> Value {
@@ -356,6 +418,46 @@ mod tests {
         // Below MIN_INTERN_LEN and/or not worth the ref overhead - must be
         // a no-op, not a transform that grows the output.
         let input = r#"[{"ok":true},{"ok":true},{"ok":true}]"#;
+        assert_round_trips(input);
+    }
+
+    #[test]
+    fn input_containing_a_literal_table_marker_round_trips_unchanged() {
+        // Confirmed real bug before escape_reserved_keys existed: this
+        // exact input silently decompressed to {"metadata":[{"a":1}]}
+        // instead of itself, because decompress_value couldn't tell "a
+        // marker we generated" from "genuine data shaped like one."
+        let input = r#"{"metadata": {"__boomerang_table__": true, "keys": ["a"], "rows": [[1]]}}"#;
+        assert_round_trips(input);
+    }
+
+    #[test]
+    fn input_containing_a_literal_intern_and_ref_marker_round_trips_unchanged() {
+        let input =
+            r#"{"__boomerang_intern__": true, "dict": ["x"], "value": {"__boomerang_ref__": 0}}"#;
+        assert_round_trips(input);
+    }
+
+    #[test]
+    fn input_key_that_already_looks_escaped_still_round_trips() {
+        // Exercises the "escaping the escaper" case: a key that already
+        // starts with ESCAPE_PREFIX (and therefore also with
+        // RESERVED_NAMESPACE, since the prefix itself lives in that
+        // namespace) must still come back out exactly as it went in.
+        let input =
+            r#"{"__boomerang_esc_something": "value", "__boomerang_esc___boomerang_table__": 1}"#;
+        assert_round_trips(input);
+    }
+
+    #[test]
+    fn reserved_looking_key_nested_inside_a_columnarized_table_round_trips() {
+        // The escape pass must run before columnarize/intern see the tree,
+        // not just at the top level - otherwise a reserved-looking key
+        // nested inside array elements would still collide.
+        let input = r#"[
+            {"id": 1, "__boomerang_ref__": "not actually a ref"},
+            {"id": 2, "__boomerang_ref__": "not actually a ref"}
+        ]"#;
         assert_round_trips(input);
     }
 

@@ -3,8 +3,14 @@
 Micro context-compression for AI agents. A much lighter, more robust take on
 [headroom](https://github.com/chopratejas/headroom): same core idea (shrink
 what an agent reads before it hits the LLM, never actually lose anything),
-built as a single static Rust binary instead of a Python package that pulls
-in `torch`+`transformers`.
+built as a single self-contained Rust binary instead of a Python package that
+pulls in `torch`+`transformers`. Measured, not asserted: 804KB release binary,
+sub-5ms cold start, only linked against the OS's own `libSystem` on macOS —
+on Linux with a musl target it's genuinely fully static. "Static" isn't quite
+the right word on macOS specifically (Apple doesn't support fully static
+linking there at all — even `libSystem` is always dynamic), so what actually
+matters and is true everywhere: no interpreter, no package manager, no venv,
+nothing that can rot out from under it the way `headroom-ai`'s did.
 
 ## Why this exists
 
