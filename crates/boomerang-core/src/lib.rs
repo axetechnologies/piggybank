@@ -3,7 +3,10 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::PathBuf;
 
+mod markers;
+mod session;
 mod text;
+pub use session::Session;
 pub use text::{compress_text, decompress_text, TextOptions};
 
 /// Content-addressed blob store. Every write is keyed by the sha256 of its

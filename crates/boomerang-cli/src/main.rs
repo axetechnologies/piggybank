@@ -1,4 +1,4 @@
-use boomerang_core::{Store, TextOptions};
+use boomerang_core::{Session, Store, TextOptions};
 use std::env;
 use std::fs;
 use std::io::{self, Write};
@@ -11,6 +11,8 @@ fn main() -> ExitCode {
         Some("decompress") => run_json(&args, boomerang_core::decompress_json),
         Some("compress-log") => run_text(&args, true),
         Some("decompress-log") => run_text(&args, false),
+        Some("compress-session") => run_session_compress(&args),
+        Some("decompress-session") => run_session_decompress(&args),
         _ => {
             usage();
             ExitCode::FAILURE
@@ -19,8 +21,12 @@ fn main() -> ExitCode {
 }
 
 fn usage() {
-    eprintln!("usage: boomerang <compress|decompress> <file>            # JSON, lossless");
-    eprintln!("       boomerang <compress-log|decompress-log> <file> [store-dir]  # text/logs");
+    eprintln!(
+        "usage: boomerang <compress|decompress> <file>                       # JSON, lossless"
+    );
+    eprintln!("       boomerang <compress-log|decompress-log> <file> [store-dir]   # text/logs");
+    eprintln!("       boomerang compress-session <key> <file> [store-dir]          # diff vs. last seen under <key>");
+    eprintln!("       boomerang decompress-session <file> [store-dir]");
 }
 
 /// Write bytes to stdout exactly as-is — no added newline, no UTF-8
@@ -83,6 +89,76 @@ fn run_text(args: &[String], compressing: bool) -> ExitCode {
         boomerang_core::decompress_text(&store, &input)
     };
     match result {
+        Ok(output) => {
+            write_stdout(&output);
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_session_compress(args: &[String]) -> ExitCode {
+    let (Some(key), Some(path)) = (args.get(2), args.get(3)) else {
+        usage();
+        return ExitCode::FAILURE;
+    };
+    let store_dir = args
+        .get(4)
+        .cloned()
+        .unwrap_or_else(|| ".boomerang-store".to_string());
+    let session = match Session::open(&store_dir) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error opening session at {store_dir}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let input = match fs::read(path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("error reading {path}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match session.compress(key, &input) {
+        Ok(output) => {
+            write_stdout(&output);
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_session_decompress(args: &[String]) -> ExitCode {
+    let Some(path) = args.get(2) else {
+        usage();
+        return ExitCode::FAILURE;
+    };
+    let store_dir = args
+        .get(3)
+        .cloned()
+        .unwrap_or_else(|| ".boomerang-store".to_string());
+    let session = match Session::open(&store_dir) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error opening session at {store_dir}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let input = match fs::read(path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("error reading {path}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match session.decompress(&input) {
         Ok(output) => {
             write_stdout(&output);
             ExitCode::SUCCESS

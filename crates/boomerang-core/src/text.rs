@@ -1,12 +1,5 @@
+use crate::markers::{strip_pua, PUA};
 use crate::Store;
-
-/// Private-use-area sentinel used to delimit Boomerang's own control lines
-/// inside compressed text. Chosen because it essentially never appears in
-/// real logs/text, so control lines can't collide with content without
-/// needing an escaping scheme. This is a real limitation against
-/// adversarial input, not a cryptographic guarantee — acceptable for text
-/// this tool generates and re-parses itself.
-const PUA: char = '\u{E000}';
 
 #[derive(Clone, Copy)]
 pub struct TextOptions {
@@ -166,14 +159,6 @@ fn parse_elide(line: &str) -> Option<(usize, String)> {
 fn parse_whole_document_elide(input: &[u8]) -> Option<String> {
     let text = std::str::from_utf8(input).ok()?;
     parse_elide(text).map(|(_, id)| id)
-}
-
-fn strip_pua<'a>(line: &'a str, prefix: &str) -> Option<&'a str> {
-    let mut chars = line.chars();
-    if chars.next() != Some(PUA) {
-        return None;
-    }
-    chars.as_str().strip_prefix(prefix)?.strip_suffix(PUA)
 }
 
 fn count_lines_bytes(input: &[u8]) -> usize {
