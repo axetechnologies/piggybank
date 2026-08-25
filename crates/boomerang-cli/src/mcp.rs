@@ -30,6 +30,7 @@
 use boomerang_core::{Session, Store, TextOptions};
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 const VIEW_VERSION: u8 = 1;
 
@@ -55,12 +56,18 @@ fn decode_view(view: &str) -> Result<(&str, &str), String> {
 struct ServerState {
     store: Store,
     session: Session,
+    total_original: AtomicU64,
+    total_compressed: AtomicU64,
+    compress_calls: AtomicU64,
 }
 
 pub fn serve(store_dir: &str) -> io::Result<()> {
     let state = ServerState {
         store: Store::open(store_dir)?,
         session: Session::open(store_dir)?,
+        total_original: AtomicU64::new(0),
+        total_compressed: AtomicU64::new(0),
+        compress_calls: AtomicU64::new(0),
     };
 
     let stdin = io::stdin();
@@ -181,7 +188,7 @@ fn tool_defs() -> Value {
         },
         {
             "name": "stats",
-            "description": "Report how many entries and how many bytes are currently held in the content store.",
+            "description": "Report store size and lifetime compression savings: total calls, bytes in, bytes out, bytes saved, and savings percentage since activation.",
             "inputSchema": { "type": "object", "properties": {} }
         },
     ])
@@ -216,6 +223,23 @@ fn handle_tools_call(state: &ServerState, id: Value, request: &Value) -> Value {
     }
 }
 
+fn record_and_savings(state: &ServerState, original: usize, compressed: usize) -> Value {
+    state.total_original.fetch_add(original as u64, Relaxed);
+    state.total_compressed.fetch_add(compressed as u64, Relaxed);
+    let calls = state.compress_calls.fetch_add(1, Relaxed) + 1;
+    let tot_orig = state.total_original.load(Relaxed);
+    let tot_comp = state.total_compressed.load(Relaxed);
+    let saved = tot_orig.saturating_sub(tot_comp);
+    let pct = if tot_orig > 0 { (saved as f64 / tot_orig as f64) * 100.0 } else { 0.0 };
+    json!({
+        "lifetime_calls": calls,
+        "lifetime_original_bytes": tot_orig,
+        "lifetime_compressed_bytes": tot_comp,
+        "lifetime_saved_bytes": saved,
+        "lifetime_saved_pct": format!("{pct:.1}%"),
+    })
+}
+
 fn handle_compress(state: &ServerState, args: &Value) -> Result<Value, String> {
     let content = args
         .get("content")
@@ -231,10 +255,12 @@ fn handle_compress(state: &ServerState, args: &Value) -> Result<Value, String> {
     if let Ok(compressed) =
         boomerang_core::compress_json_with_store(content.as_bytes(), &state.store)
     {
+        let savings = record_and_savings(state, content.len(), compressed.len());
         return Ok(json!({
             "view": encode_view("json", &compressed),
             "original_bytes": content.len(),
             "compressed_bytes": compressed.len(),
+            "savings": savings,
         }));
     }
 
@@ -257,10 +283,12 @@ fn handle_compress(state: &ServerState, args: &Value) -> Result<Value, String> {
         ),
     };
 
+    let savings = record_and_savings(state, content.len(), compressed.len());
     Ok(json!({
         "view": encode_view(kind, &compressed),
         "original_bytes": content.len(),
         "compressed_bytes": compressed.len(),
+        "savings": savings,
     }))
 }
 
@@ -338,5 +366,17 @@ fn handle_retrieve(state: &ServerState, args: &Value) -> Result<Value, String> {
 
 fn handle_stats(state: &ServerState) -> Result<Value, String> {
     let stats = state.store.stats().map_err(|e| e.to_string())?;
-    Ok(json!({ "store_entries": stats.entries, "store_bytes": stats.bytes }))
+    let tot_orig = state.total_original.load(Relaxed);
+    let tot_comp = state.total_compressed.load(Relaxed);
+    let saved = tot_orig.saturating_sub(tot_comp);
+    let pct = if tot_orig > 0 { (saved as f64 / tot_orig as f64) * 100.0 } else { 0.0 };
+    Ok(json!({
+        "store_entries": stats.entries,
+        "store_bytes": stats.bytes,
+        "lifetime_calls": state.compress_calls.load(Relaxed),
+        "lifetime_original_bytes": tot_orig,
+        "lifetime_compressed_bytes": tot_comp,
+        "lifetime_saved_bytes": saved,
+        "lifetime_saved_pct": format!("{pct:.1}%"),
+    }))
 }
