@@ -53,18 +53,18 @@ of it, proven not just designed:
   in `crates/boomerang-core/src/json.rs`).
 - **Provenance.** Every piece of content ever written to the store records
   when it was first seen (`.provenance.jsonl`, best-effort, never blocks
-  the write it's attached to), retrievable via `boomerang_retrieve`'s
+  the write it's attached to), retrievable via the `retrieve` tool's
   `first_seen_unix` field — regardless of which caller originally wrote it.
   "What did any agent see, and when" becomes an answerable question instead
   of something lost the moment content gets compressed away.
-- **Integrity verification without full reconstruction.** `boomerang_verify`
+- **Integrity verification without full reconstruction.** The `verify` tool
   walks a compressed view's reference chain and confirms every id still
   resolves in the store — `Store::exists` (a stat), not `Store::get` (a
   read) — reporting exactly which references are missing rather than
-  failing outright. Cheaper than a full `boomerang_decompress` when a
-  caller only needs "is this still fully reconstructable right now," not
-  the content itself: a lightweight audit/integrity primitive, not just a
-  compression optimization.
+  failing outright. Cheaper than a full `decompress` when a caller only
+  needs "is this still fully reconstructable right now," not the content
+  itself: a lightweight audit/integrity primitive, not just a compression
+  optimization.
 - **Retention, honestly scoped.** "Nothing is ever discarded" is the
   compression invariant, not a promise that a shared store grows forever
   for free. `Store::gc(older_than_unix, dry_run)` / `boomerang gc
@@ -117,8 +117,8 @@ the current state:
   "only commit if it actually shrinks" guarantee as everything else here
   (the marker itself costs 89 bytes; anything smaller than that never gets
   promoted, checked exactly, not just filtered by a threshold). This is
-  what the MCP server's `boomerang_compress`/`boomerang_decompress` use for
-  JSON; the plain `compress_json`/`decompress_json` above stay pure and
+  what the MCP server's `compress`/`decompress` tools use for JSON; the
+  plain `compress_json`/`decompress_json` above stay pure and
   store-free for callers (like the CLI's `compress`/`decompress`) that want
   a single, stateless, self-contained transform.
 - `compress_text` / `decompress_text` — dedup of consecutive repeated lines
@@ -133,12 +133,9 @@ the current state:
 
 `boomerang mcp serve` ([`crates/boomerang-cli/src/mcp.rs`](crates/boomerang-cli/src/mcp.rs))
 exposes all of it over stdio as a hand-rolled MCP server — no SDK, no async
-runtime, just newline-delimited JSON-RPC. Four tools: three named to mirror
-headroom's own surface (`boomerang_compress`, `boomerang_retrieve`,
-`boomerang_stats`), plus `boomerang_decompress` — full reconstruction of a
-compressed view given the `kind` `compress` returned, which headroom's
-surface doesn't expose and which session-mode compression genuinely needs
-(there's no other way to get the diffed-and-reassembled new content back).
+runtime, just newline-delimited JSON-RPC. Five tools, named as clean verbs
+(the server name already provides the namespace): `compress`, `decompress`,
+`verify`, `retrieve`, `stats`.
 
 Not built yet:
 
