@@ -30,6 +30,34 @@ around is content-addressed, reversible retrieval — nothing is ever deleted,
 only set aside, and it comes back the moment something asks for it by
 reference. A boomerang doesn't need to be fetched — it's already coming back.
 
+## Beyond compression
+
+Strip away the "compressor" framing and what's actually been built is a
+content-addressed, atomically-written, crash-safe, *provably* reversible
+blob store — compress/decompress round-trips are tested exhaustively
+(proptest fuzzing, verified against the real binary, not just asserted),
+not approximated the way headroom's ML-based CCR caching is. That primitive
+is worth more than the compression it happens to enable. Two consequences
+of it, proven not just designed:
+
+- **Shared memory across agents that never coordinate.** `Store` is just
+  content-addressed files in a directory with atomic writes — nothing
+  requires one caller to know another exists. Two completely independent
+  `boomerang mcp serve` processes pointed at the same store directory, with
+  zero communication between them, compound each other's compression
+  history automatically: the second agent's very first call already
+  benefits from content the first agent introduced. headroom has no
+  equivalent — its compression state doesn't cross process boundaries.
+  Verified with two genuinely separate subprocesses, not two calls in one
+  process (`two_independent_callers_sharing_a_store_benefit_from_each_others_history`
+  in `crates/boomerang-core/src/json.rs`).
+- **Provenance.** Every piece of content ever written to the store records
+  when it was first seen (`.provenance.jsonl`, best-effort, never blocks
+  the write it's attached to), retrievable via `boomerang_retrieve`'s
+  `first_seen_unix` field — regardless of which caller originally wrote it.
+  "What did any agent see, and when" becomes an answerable question instead
+  of something lost the moment content gets compressed away.
+
 ## Design
 
 Two primitives, nothing else load-bearing:
@@ -44,7 +72,10 @@ the current state:
 - `Store` — a content-addressed blob store (`sha256(bytes) -> bytes` on
   disk). Writing the same content twice is a no-op. This is what makes
   compression reversible: a compressor never decides what's safe to discard,
-  because nothing it stores here is ever discarded.
+  because nothing it stores here is ever discarded. Every genuinely new
+  write also records a first-seen timestamp (`first_seen()`,
+  best-effort, never blocks the write it's attached to) — see "Beyond
+  compression" below for what that and shared-directory writes make possible.
 - `compress_json` / `decompress_json` — **lossless** structural compression,
   two composable passes. First, homogeneous arrays of objects (the shape of
   almost every API response or tool-result list) become a columnar table:

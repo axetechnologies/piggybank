@@ -21,7 +21,8 @@
 //! - `boomerang_decompress` — full reconstruction of a compressed view,
 //!   given the `kind` `compress` returned alongside it.
 //! - `boomerang_retrieve` — fetch the exact original bytes behind a
-//!   reference id embedded in a compressed view.
+//!   reference id embedded in a compressed view, plus when that content
+//!   first entered the store (by any caller sharing it, not just this one).
 //! - `boomerang_stats` — entry count and total bytes held in the store.
 
 use boomerang_core::{Session, Store, TextOptions};
@@ -136,7 +137,7 @@ fn tool_defs() -> Value {
         },
         {
             "name": "boomerang_retrieve",
-            "description": "Fetch the exact original bytes behind a reference id embedded in a compressed view (e.g. the id inside a BOOMERANG:ELIDE:... marker). Nothing boomerang_compress writes to its store is ever discarded, so this always succeeds for a ref it actually returned.",
+            "description": "Fetch the exact original bytes behind a reference id embedded in a compressed view (e.g. the id inside a BOOMERANG:ELIDE:... marker). Nothing boomerang_compress writes to its store is ever discarded, so this always succeeds for a ref it actually returned. Response includes first_seen_unix - when this exact content first entered the store, by any caller, not just this one (null if written before provenance tracking existed).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -268,7 +269,13 @@ fn handle_retrieve(state: &ServerState, args: &Value) -> Result<Value, String> {
         .and_then(Value::as_str)
         .ok_or("missing 'ref' argument")?;
     let bytes = state.store.get(reference).map_err(|e| e.to_string())?;
-    Ok(json!({ "content": String::from_utf8_lossy(&bytes) }))
+    // Best-effort provenance: when this content first entered the store,
+    // Unix seconds, however it got there (this caller or another one
+    // entirely sharing the same store - see the cross-call memory tests).
+    // Missing for content written before provenance tracking existed;
+    // never fails the retrieve itself.
+    let first_seen_unix = state.store.first_seen(reference).ok().flatten();
+    Ok(json!({ "content": String::from_utf8_lossy(&bytes), "first_seen_unix": first_seen_unix }))
 }
 
 fn handle_stats(state: &ServerState) -> Result<Value, String> {

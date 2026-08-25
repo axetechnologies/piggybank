@@ -57,8 +57,69 @@ impl Store {
             let tmp_path = self.root.join(format!("{id}.tmp.{}", std::process::id()));
             fs::write(&tmp_path, bytes)?;
             fs::rename(&tmp_path, &path)?;
+            // Best-effort audit trail: record when this content was first
+            // ever seen. Deliberately not part of the atomic write above
+            // and deliberately not allowed to fail this call - the content
+            // write is the correctness-critical path (get() must see it),
+            // provenance is a secondary record about it. A disk-full or
+            // permissions hiccup on the log must not turn a successful
+            // store write into a failed one.
+            self.record_first_seen(&id);
         }
         Ok((id, already_existed))
+    }
+
+    /// Append `{"id":..., "first_seen_unix":...}` to `.provenance.jsonl`.
+    /// Best-effort: errors are swallowed, never propagated - see the call
+    /// site's comment for why. Only ever called for genuinely new content
+    /// (once per distinct id, since `put_check_existing` only reaches this
+    /// when `already_existed` was false), so this is a true first-sight
+    /// record, not a per-access log.
+    fn record_first_seen(&self, id: &str) {
+        let Ok(duration) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        else {
+            return;
+        };
+        let record = serde_json::json!({ "id": id, "first_seen_unix": duration.as_secs() });
+        let line = format!("{record}\n");
+        if let Ok(mut file) = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.root.join(".provenance.jsonl"))
+        {
+            use std::io::Write;
+            let _ = file.write_all(line.as_bytes());
+        }
+    }
+
+    /// Look up when `id` was first ever written to this store. `Ok(None)`
+    /// covers both "no such content" and "written before provenance
+    /// tracking existed" - a linear scan of an append-only log, which is
+    /// fine at the scale this is meant for (an audit lookup, not a hot
+    /// path); revisit only if a real long-lived store's log size makes
+    /// that untrue.
+    pub fn first_seen(&self, id: &str) -> std::io::Result<Option<u64>> {
+        if !is_valid_id(id) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid content id",
+            ));
+        }
+        let path = self.root.join(".provenance.jsonl");
+        let contents = match fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        for line in contents.lines() {
+            let Ok(record) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue; // a torn last line from a concurrent writer, or similar - skip, don't fail the lookup
+            };
+            if record.get("id").and_then(|v| v.as_str()) == Some(id) {
+                return Ok(record.get("first_seen_unix").and_then(|v| v.as_u64()));
+            }
+        }
+        Ok(None)
     }
 
     /// Fetch content by id. Confirmed real, not theoretical: before this
@@ -146,21 +207,24 @@ mod tests {
     fn put_leaves_no_orphaned_temp_file_and_content_is_readable_immediately() {
         // put() now writes to a temp file and renames into place (fixed
         // fs::write alone not being atomic - see put()'s doc comment).
-        // Confirms the happy path still leaves exactly the final file,
-        // nothing else, and get() sees it right away.
+        // Confirms the happy path leaves exactly the final content file
+        // plus the provenance sidecar, no leftover .tmp, and get() sees it
+        // right away.
         let dir =
             std::env::temp_dir().join(format!("boomerang-atomic-test-{}", std::process::id()));
         let store = Store::open(&dir).unwrap();
         let id = store.put(b"atomic write check").unwrap();
         assert_eq!(store.get(&id).unwrap(), b"atomic write check");
 
-        let entries: Vec<String> = fs::read_dir(&dir)
+        let mut entries: Vec<String> = fs::read_dir(&dir)
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
             .collect();
+        entries.sort();
+        let mut expected = vec![id, ".provenance.jsonl".to_string()];
+        expected.sort();
         assert_eq!(
-            entries,
-            vec![id],
+            entries, expected,
             "no leftover .tmp file after a successful put"
         );
         fs::remove_dir_all(&dir).ok();
@@ -195,6 +259,58 @@ mod tests {
                 "must be rejected as invalid input, not fail for some other reason"
             );
         }
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn first_seen_records_new_content_and_is_stable_across_duplicate_puts() {
+        let dir =
+            std::env::temp_dir().join(format!("boomerang-provenance-test-{}", std::process::id()));
+        let store = Store::open(&dir).unwrap();
+
+        // Content never written: no record, not an error.
+        let never_written = "a".repeat(64);
+        assert_eq!(store.first_seen(&never_written).unwrap(), None);
+
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let id = store.put(b"provenance check").unwrap();
+        let after = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let first_seen = store.first_seen(&id).unwrap().expect("must be recorded");
+        assert!(
+            (before..=after).contains(&first_seen),
+            "recorded timestamp {first_seen} must fall within [{before}, {after}]"
+        );
+
+        // Re-putting the same content must not create a second record with
+        // a later timestamp - it's "first seen," not "last seen."
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        store.put(b"provenance check").unwrap();
+        assert_eq!(
+            store.first_seen(&id).unwrap(),
+            Some(first_seen),
+            "re-putting identical content must not change its first-seen record"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn first_seen_rejects_invalid_ids_same_as_get() {
+        let dir = std::env::temp_dir().join(format!(
+            "boomerang-provenance-validation-test-{}",
+            std::process::id()
+        ));
+        let store = Store::open(&dir).unwrap();
+        let result = store.first_seen("../../../etc/passwd");
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
         fs::remove_dir_all(&dir).ok();
     }
 }
