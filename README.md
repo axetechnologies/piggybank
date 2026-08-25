@@ -37,7 +37,7 @@ content-addressed, atomically-written, crash-safe, *provably* reversible
 blob store — compress/decompress round-trips are tested exhaustively
 (proptest fuzzing, verified against the real binary, not just asserted),
 not approximated the way headroom's ML-based CCR caching is. That primitive
-is worth more than the compression it happens to enable. Three consequences
+is worth more than the compression it happens to enable. Four consequences
 of it, proven not just designed:
 
 - **Shared memory across agents that never coordinate.** `Store` is just
@@ -65,6 +65,17 @@ of it, proven not just designed:
   caller only needs "is this still fully reconstructable right now," not
   the content itself: a lightweight audit/integrity primitive, not just a
   compression optimization.
+- **Retention, honestly scoped.** "Nothing is ever discarded" is the
+  compression invariant, not a promise that a shared store grows forever
+  for free. `Store::gc(older_than_unix, dry_run)` / `boomerang gc
+  <store-dir> --older-than-days N [--dry-run]` deletes content by age -
+  the only policy a content-addressed store can apply *safely* without a
+  full reachability graph of every compressed view sitting in some agent's
+  conversation history far outside this store's view. Content with no
+  recorded first-seen time is never touched (no basis to judge it
+  eligible), and this is deliberately CLI-only, human-invoked, dry-run
+  capable, and never exposed over MCP - an agent should not be able to
+  delete shared, possibly-multi-tenant content on its own initiative.
 
 ## Design
 

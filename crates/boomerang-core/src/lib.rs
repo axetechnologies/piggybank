@@ -173,6 +173,101 @@ impl Store {
         }
         Ok(StoreStats { entries, bytes })
     }
+
+    /// Delete content first seen before `older_than_unix` (Unix seconds).
+    /// Age-based, deliberately: the only policy `Store` can apply safely.
+    /// It has no way to know whether some compressed view sitting in an
+    /// agent's conversation history, a log file, or another store entirely
+    /// still depends on a given id — a true reachability sweep would need
+    /// that global picture, which nothing here has or could have. Age is a
+    /// blunt instrument compared to that, but it's a *safe* one: it never
+    /// second-guesses content, only how long it's been sitting there.
+    /// `boomerang_verify` exists precisely so a caller can check, before or
+    /// after a GC run, whether something it still cares about survived.
+    ///
+    /// Entries with no provenance record (written before provenance
+    /// tracking existed, or if the log was ever lost) are never deleted -
+    /// with no recorded age, there's no basis to decide they're eligible,
+    /// and "don't destroy what you can't date" is the conservative choice.
+    ///
+    /// `dry_run: true` reports exactly what *would* be deleted - which ids,
+    /// how many bytes - without touching anything. This is deliberately
+    /// never wired into the MCP server: an agent should not be able to
+    /// delete shared, possibly-multi-tenant store content on its own
+    /// initiative. It's a CLI-only, explicit, human-invoked operation.
+    pub fn gc(&self, older_than_unix: u64, dry_run: bool) -> std::io::Result<GcResult> {
+        let provenance_path = self.root.join(".provenance.jsonl");
+        let mut ages: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+        if let Ok(contents) = fs::read_to_string(&provenance_path) {
+            for line in contents.lines() {
+                if let Ok(record) = serde_json::from_str::<serde_json::Value>(line) {
+                    if let (Some(id), Some(ts)) = (
+                        record.get("id").and_then(|v| v.as_str()),
+                        record.get("first_seen_unix").and_then(|v| v.as_u64()),
+                    ) {
+                        ages.insert(id.to_string(), ts);
+                    }
+                }
+            }
+        }
+
+        let mut result = GcResult::default();
+        let mut deleted_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for entry in fs::read_dir(&self.root)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(id) = name.to_str().filter(|s| is_valid_id(s)) else {
+                continue;
+            };
+            let Some(&first_seen) = ages.get(id) else {
+                result.skipped_no_provenance += 1;
+                continue;
+            };
+            if first_seen >= older_than_unix {
+                continue;
+            }
+            let size = entry.metadata()?.len();
+            if !dry_run {
+                fs::remove_file(entry.path())?;
+            }
+            result.deleted += 1;
+            result.freed_bytes += size;
+            deleted_ids.insert(id.to_string());
+        }
+
+        if !dry_run && !deleted_ids.is_empty() {
+            // Rewrite the provenance log without the deleted ids' records,
+            // via the same write-temp-then-atomic-rename pattern put() uses
+            // - a reader must never see a torn/partial log.
+            let remaining: String = ages
+                .iter()
+                .filter(|(id, _)| !deleted_ids.contains(id.as_str()))
+                .map(|(id, ts)| {
+                    format!(
+                        "{}\n",
+                        serde_json::json!({ "id": id, "first_seen_unix": ts })
+                    )
+                })
+                .collect();
+            let tmp_path = self
+                .root
+                .join(format!(".provenance.jsonl.tmp.{}", std::process::id()));
+            fs::write(&tmp_path, remaining)?;
+            fs::rename(&tmp_path, &provenance_path)?;
+        }
+
+        Ok(result)
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GcResult {
+    pub deleted: usize,
+    pub freed_bytes: u64,
+    /// Entries with no provenance record - never deleted, see `gc`'s doc
+    /// comment for why. Surfaced so an operator can see how much of the
+    /// store this GC policy simply can't make a decision about.
+    pub skipped_no_provenance: usize,
 }
 
 /// A valid content id is exactly what `hex::encode(Sha256::digest(_))`
@@ -374,6 +469,86 @@ mod tests {
         let result = store.exists("../../../etc/passwd");
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn gc_deletes_only_content_older_than_cutoff_with_a_recorded_age() {
+        let dir = std::env::temp_dir().join(format!("boomerang-gc-test-{}", std::process::id()));
+        let store = Store::open(&dir).unwrap();
+
+        let old_id = store.put(b"old content").unwrap();
+        let new_id = store.put(b"new content").unwrap();
+
+        // Backdate old_id's provenance record; leave new_id far in the
+        // future so it's unambiguously "not old" regardless of when this
+        // test actually runs.
+        let provenance_path = dir.join(".provenance.jsonl");
+        let rewritten = format!(
+            "{}\n{}\n",
+            serde_json::json!({"id": old_id, "first_seen_unix": 1000u64}),
+            serde_json::json!({"id": new_id, "first_seen_unix": 9_999_999_999u64}),
+        );
+        fs::write(&provenance_path, rewritten).unwrap();
+
+        // Content with no provenance record at all - written directly,
+        // bypassing put() - simulates something stored before provenance
+        // tracking existed. Must survive: no recorded age, no basis to
+        // decide it's eligible.
+        let unrecorded_content: &[u8] = b"unrecorded content";
+        let unrecorded_id = hex::encode(Sha256::digest(unrecorded_content));
+        fs::write(dir.join(&unrecorded_id), unrecorded_content).unwrap();
+
+        let result = store.gc(5000, false).unwrap();
+        assert_eq!(result.deleted, 1);
+        assert_eq!(result.freed_bytes, "old content".len() as u64);
+        assert_eq!(result.skipped_no_provenance, 1);
+
+        assert!(!store.exists(&old_id).unwrap(), "old content must be gone");
+        assert!(store.exists(&new_id).unwrap(), "new content must survive");
+        assert!(
+            store.exists(&unrecorded_id).unwrap(),
+            "content with no recorded age must survive"
+        );
+
+        // The provenance log itself must have dropped the deleted entry
+        // but kept the survivor's record intact.
+        assert_eq!(store.first_seen(&old_id).unwrap(), None);
+        assert_eq!(store.first_seen(&new_id).unwrap(), Some(9_999_999_999));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn gc_dry_run_reports_without_deleting_or_rewriting_provenance() {
+        let dir =
+            std::env::temp_dir().join(format!("boomerang-gc-dryrun-test-{}", std::process::id()));
+        let store = Store::open(&dir).unwrap();
+        let id = store.put(b"should survive the dry run").unwrap();
+        fs::write(
+            dir.join(".provenance.jsonl"),
+            format!(
+                "{}\n",
+                serde_json::json!({"id": id, "first_seen_unix": 1000u64})
+            ),
+        )
+        .unwrap();
+
+        let result = store.gc(999_999_999, true).unwrap();
+        assert_eq!(
+            result.deleted, 1,
+            "dry run still reports what would be deleted"
+        );
+        assert!(
+            store.exists(&id).unwrap(),
+            "dry run must not actually delete anything"
+        );
+        assert_eq!(
+            store.first_seen(&id).unwrap(),
+            Some(1000),
+            "dry run must not rewrite provenance either"
+        );
 
         fs::remove_dir_all(&dir).ok();
     }
