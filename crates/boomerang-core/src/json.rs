@@ -769,6 +769,58 @@ mod tests {
     }
 
     #[test]
+    fn two_independent_callers_sharing_a_store_benefit_from_each_others_history() {
+        // The actual claim this locks in: cross-call memory isn't scoped to
+        // one caller's own history. Two Store handles opened separately
+        // against the SAME directory (standing in for two entirely
+        // independent agent sessions/processes that never coordinate with
+        // each other) - the second one's FIRST EVER call already benefits
+        // from content the first one wrote, because Store is just
+        // content-addressed files on disk and neither side needs to know
+        // the other exists. Verified for real, not just at this library
+        // level, against two separate `boomerang mcp serve` subprocesses.
+        let dir = std::env::temp_dir().join(format!(
+            "boomerang-shared-store-test-{:?}-{}",
+            std::time::SystemTime::now(),
+            std::process::id()
+        ));
+        let store_a = crate::Store::open(&dir).unwrap();
+        let store_b = crate::Store::open(&dir).unwrap(); // independent handle, same directory
+
+        let shared_policy = format!(
+            r#"{{"id":"policy_v3","rules":{{"mfa":true,"timeout":30}},"description":"{}"}}"#,
+            "shared enterprise policy text padding ".repeat(3)
+        );
+
+        let doc_a = format!(r#"{{"agent":"A","task":"onboarding","policy":{shared_policy}}}"#);
+        let compressed_a = compress_json_with_store(doc_a.as_bytes(), &store_a).unwrap();
+        assert!(
+            String::from_utf8_lossy(&compressed_a).contains("mfa"),
+            "agent A's first-ever call has nothing to reference yet - must be inline"
+        );
+
+        // Agent B has NEVER called compress before, on ITS OWN handle - but
+        // the underlying directory already has agent A's content on disk.
+        let doc_b =
+            format!(r#"{{"agent":"B","task":"audit","extra":[1,2,3],"policy":{shared_policy}}}"#);
+        let compressed_b = compress_json_with_store(doc_b.as_bytes(), &store_b).unwrap();
+        assert!(
+            !String::from_utf8_lossy(&compressed_b).contains("mfa"),
+            "agent B's FIRST call must already benefit from agent A's history: {}",
+            String::from_utf8_lossy(&compressed_b)
+        );
+        assert!(String::from_utf8_lossy(&compressed_b).contains(CROSS_CALL_REF_MARKER));
+
+        // And agent B must still be able to reconstruct exactly, via the shared store.
+        let restored: Value =
+            serde_json::from_slice(&decompress_json_with_store(&compressed_b, &store_b).unwrap())
+                .unwrap();
+        assert_eq!(restored, serde_json::from_str::<Value>(&doc_b).unwrap());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn input_containing_a_literal_cref_marker_round_trips_unchanged() {
         // Same collision class already fixed for the other three markers -
         // escape_reserved_keys protects this one too automatically, since
