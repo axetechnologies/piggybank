@@ -137,6 +137,25 @@ runtime, just newline-delimited JSON-RPC. Five tools, named as clean verbs
 (the server name already provides the namespace): `compress`, `decompress`,
 `verify`, `retrieve`, `stats`.
 
+## Claude Code setup
+
+Add to your MCP config (`~/.claude/claude_desktop_config.json` or project `.mcp.json`):
+
+```json
+{
+  "mcpServers": {
+    "boomerang": {
+      "command": "boomerang",
+      "args": ["mcp", "serve"]
+    }
+  }
+}
+```
+
+Tools appear as `compress`, `decompress`, `verify`, `retrieve`, `stats`.
+Compress returns an opaque `view` string — pass it directly to decompress
+or verify. No `kind` tracking needed.
+
 Not built yet:
 
 - An HTTP proxy binary, sharing the same core crate.

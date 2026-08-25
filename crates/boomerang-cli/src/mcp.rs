@@ -31,6 +31,27 @@ use boomerang_core::{Session, Store, TextOptions};
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
 
+const VIEW_VERSION: u8 = 1;
+
+fn encode_view(kind: &str, compressed: &[u8]) -> String {
+    format!("BOOM:{}:{}\n{}", VIEW_VERSION, kind, String::from_utf8_lossy(compressed))
+}
+
+fn decode_view(view: &str) -> Result<(&str, &str), String> {
+    let newline = view.find('\n').ok_or("invalid view: missing header")?;
+    let header = &view[..newline];
+    let body = &view[newline + 1..];
+    let parts: Vec<&str> = header.splitn(3, ':').collect();
+    if parts.len() != 3 || parts[0] != "BOOM" {
+        return Err("invalid view: expected BOOM:<version>:<kind> header".into());
+    }
+    let version: u8 = parts[1].parse().map_err(|_| "invalid view: bad version")?;
+    if version != VIEW_VERSION {
+        return Err(format!("unsupported view version: {version} (expected {VIEW_VERSION})"));
+    }
+    Ok((parts[2], body))
+}
+
 struct ServerState {
     store: Store,
     session: Session,
@@ -127,26 +148,24 @@ fn tool_defs() -> Value {
         },
         {
             "name": "decompress",
-            "description": "Reconstruct the exact original content from a compressed view returned by compress. Requires `kind` (the value compress returned alongside `compressed`) since the three compressors use distinct, non-overlapping marker schemes and guessing which one produced a given view is unreliable in the general case - pass back what compress told you.",
+            "description": "Reconstruct the exact original content from an opaque view returned by compress. The view encodes everything needed for reconstruction - just pass it back.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "compressed": { "type": "string", "description": "The compressed view text, exactly as returned by compress." },
-                    "kind": { "type": "string", "description": "One of \"json\", \"text\", or \"session\" - the `kind` field from the matching compress call." }
+                    "view": { "type": "string", "description": "The opaque view string returned by compress." }
                 },
-                "required": ["compressed", "kind"]
+                "required": ["view"]
             }
         },
         {
             "name": "verify",
-            "description": "Confirm a compressed view's references still resolve in the store, without doing the full reconstruction decompress does - cheaper when a caller only needs to know reconstruction is still possible right now, not the content itself. Requires `kind`, same as decompress. Returns ok, checked_refs (how many references were found and checked), and missing_refs (any that no longer resolve - empty when ok is true).",
+            "description": "Confirm a compressed view's references still resolve in the store, without full reconstruction. Cheaper than decompress when you only need to know reconstruction is still possible. Returns ok, checked_refs, and missing_refs.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "compressed": { "type": "string", "description": "The compressed view text, exactly as returned by compress." },
-                    "kind": { "type": "string", "description": "One of \"json\", \"text\", or \"session\" - the `kind` field from the matching compress call." }
+                    "view": { "type": "string", "description": "The opaque view string returned by compress." }
                 },
-                "required": ["compressed", "kind"]
+                "required": ["view"]
             }
         },
         {
@@ -213,8 +232,9 @@ fn handle_compress(state: &ServerState, args: &Value) -> Result<Value, String> {
         boomerang_core::compress_json_with_store(content.as_bytes(), &state.store)
     {
         return Ok(json!({
-            "compressed": String::from_utf8_lossy(&compressed),
-            "kind": "json",
+            "view": encode_view("json", &compressed),
+            "original_bytes": content.len(),
+            "compressed_bytes": compressed.len(),
         }));
     }
 
@@ -238,64 +258,38 @@ fn handle_compress(state: &ServerState, args: &Value) -> Result<Value, String> {
     };
 
     Ok(json!({
-        "compressed": String::from_utf8_lossy(&compressed),
-        "kind": kind,
+        "view": encode_view(kind, &compressed),
+        "original_bytes": content.len(),
+        "compressed_bytes": compressed.len(),
     }))
 }
 
 fn handle_decompress(state: &ServerState, args: &Value) -> Result<Value, String> {
-    let compressed = args
-        .get("compressed")
+    let view = args
+        .get("view")
         .and_then(Value::as_str)
-        .ok_or("missing 'compressed' argument")?;
-    let kind = args
-        .get("kind")
-        .and_then(Value::as_str)
-        .ok_or("missing 'kind' argument (one of: json, text, session)")?;
+        .ok_or("missing 'view' argument")?;
+    let (kind, body) = decode_view(view)?;
 
-    let restored = match kind {
-        // Must be the store-backed variant, matching handle_compress: a
-        // "json" view from this server may contain a cross-call reference
-        // (__boomerang_cref__) that plain decompress_json doesn't know how
-        // to resolve - it would pass it through unchanged as if it were
-        // ordinary data instead of erroring, which is exactly the kind of
-        // silent-wrong-output failure this project treats as a real bug.
-        "json" => boomerang_core::decompress_json_with_store(compressed.as_bytes(), &state.store)
-            .map_err(|e| e.to_string())?,
-        "text" => boomerang_core::decompress_text(&state.store, compressed.as_bytes())
-            .map_err(|e| e.to_string())?,
-        "session" => state
-            .session
-            .decompress(compressed.as_bytes())
-            .map_err(|e| e.to_string())?,
-        other => {
-            return Err(format!(
-                "unknown kind: {other} (expected json, text, or session)"
-            ))
-        }
-    };
-
+    let restored = dispatch_decompress(state, kind, body)?;
     Ok(json!({ "content": String::from_utf8_lossy(&restored) }))
 }
 
 fn handle_verify(state: &ServerState, args: &Value) -> Result<Value, String> {
-    let compressed = args
-        .get("compressed")
+    let view = args
+        .get("view")
         .and_then(Value::as_str)
-        .ok_or("missing 'compressed' argument")?;
-    let kind = args
-        .get("kind")
-        .and_then(Value::as_str)
-        .ok_or("missing 'kind' argument (one of: json, text, session)")?;
+        .ok_or("missing 'view' argument")?;
+    let (kind, body) = decode_view(view)?;
 
     let result = match kind {
-        "json" => boomerang_core::verify_json_with_store(compressed.as_bytes(), &state.store)
+        "json" => boomerang_core::verify_json_with_store(body.as_bytes(), &state.store)
             .map_err(|e| e.to_string())?,
-        "text" => boomerang_core::verify_text_with_store(&state.store, compressed.as_bytes())
+        "text" => boomerang_core::verify_text_with_store(&state.store, body.as_bytes())
             .map_err(|e| e.to_string())?,
         "session" => state
             .session
-            .verify(compressed.as_bytes())
+            .verify(body.as_bytes())
             .map_err(|e| e.to_string())?,
         other => {
             return Err(format!(
@@ -309,6 +303,22 @@ fn handle_verify(state: &ServerState, args: &Value) -> Result<Value, String> {
         "checked_refs": result.checked_refs,
         "missing_refs": result.missing_refs,
     }))
+}
+
+fn dispatch_decompress(state: &ServerState, kind: &str, body: &str) -> Result<Vec<u8>, String> {
+    match kind {
+        "json" => boomerang_core::decompress_json_with_store(body.as_bytes(), &state.store)
+            .map_err(|e| e.to_string()),
+        "text" => boomerang_core::decompress_text(&state.store, body.as_bytes())
+            .map_err(|e| e.to_string()),
+        "session" => state
+            .session
+            .decompress(body.as_bytes())
+            .map_err(|e| e.to_string()),
+        other => Err(format!(
+            "unknown kind: {other} (expected json, text, or session)"
+        )),
+    }
 }
 
 fn handle_retrieve(state: &ServerState, args: &Value) -> Result<Value, String> {

@@ -26,6 +26,11 @@ impl Store {
     pub fn open(root: impl Into<PathBuf>) -> std::io::Result<Self> {
         let root = root.into();
         fs::create_dir_all(&root)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
+        }
         Ok(Self { root })
     }
 
