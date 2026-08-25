@@ -470,6 +470,17 @@ mod tests {
                 let restored = decompress_text(&store, &compressed).unwrap();
                 prop_assert_eq!(restored, text.into_bytes());
             }
+
+            /// Same property as json.rs's: verify must never false-flag a
+            /// view produced against a store that's still fully intact.
+            #[test]
+            fn verify_never_false_flags_an_intact_store(text in arb_text(), opts in arb_opts()) {
+                let store = temp_store();
+                let compressed = compress_text(&store, text.as_bytes(), &opts).unwrap();
+                let result = verify_text_with_store(&store, &compressed).unwrap();
+                prop_assert!(result.ok);
+                prop_assert!(result.missing_refs.is_empty());
+            }
         }
 
         /// Vary the thresholds too, not just content - default options

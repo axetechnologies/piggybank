@@ -601,6 +601,22 @@ mod tests {
                     prop_assert_eq!(restored, content.into_bytes());
                 }
             }
+
+            /// Same property as json.rs's/text.rs's: verify must never
+            /// false-flag a view produced against a store that's still
+            /// fully intact.
+            #[test]
+            fn verify_never_false_flags_an_intact_store(
+                ops in prop::collection::vec((arb_key(), arb_content()), 1..12)
+            ) {
+                let session = Session::new(temp_store());
+                for (key, content) in ops {
+                    let compressed = session.compress(&key, content.as_bytes()).unwrap();
+                    let result = session.verify(&compressed).unwrap();
+                    prop_assert!(result.ok);
+                    prop_assert!(result.missing_refs.is_empty());
+                }
+            }
         }
     }
 }

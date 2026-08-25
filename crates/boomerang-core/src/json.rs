@@ -823,6 +823,84 @@ mod tests {
     }
 
     #[test]
+    fn gc_must_not_delete_a_blob_still_referenced_by_a_surviving_blob() {
+        // A stored blob's OWN content can literally contain a
+        // __boomerang_cref__ pointing at another stored blob - confirmed
+        // by direct inspection, not assumed: `wraps_inner` occurring only
+        // ONCE per document (so within-document intern_value has nothing
+        // to collapse, forcing cross_call_intern to be the one that
+        // recognizes the repeat) produces a doc_x blob whose own bytes
+        // embed inner's cref. If age-based GC deletes `inner` (old) while
+        // keeping `doc_x` (newer, survives its own age check) with no
+        // awareness that doc_x's stored bytes reference inner, doc_x
+        // becomes internally broken even though GC never touched doc_x
+        // and doc_x passed its own age check on its own terms.
+        let (store, dir) = temp_store_with_dir();
+        let inner = format!(r#"{{"payload":"{}"}}"#, "y".repeat(100));
+
+        compress_json_with_store(inner.as_bytes(), &store).unwrap(); // call 1: promote inner
+        let inner_compressed = compress_json_with_store(inner.as_bytes(), &store).unwrap(); // call 2: inner -> cref
+        let inner_id = serde_json::from_slice::<Value>(&inner_compressed)
+            .unwrap()
+            .get(CROSS_CALL_REF_MARKER)
+            .and_then(Value::as_str)
+            .expect("inner should have been promoted to a cref by its second sight")
+            .to_string();
+
+        let doc_x = format!(
+            r#"{{"wraps_inner":{inner},"tag":"unique-x-tag-{}"}}"#,
+            "q".repeat(80)
+        );
+        let doc_x_call1 = compress_json_with_store(doc_x.as_bytes(), &store).unwrap();
+        assert!(
+            String::from_utf8_lossy(&doc_x_call1).contains(&inner_id),
+            "sanity: doc_x's first-sight view must embed inner's cref directly (single occurrence, nothing for intern_value to collapse first)"
+        );
+        let doc_x_call2 = compress_json_with_store(doc_x.as_bytes(), &store).unwrap(); // doc_x -> its own cref now
+
+        // Sanity: this really does still work before any GC.
+        let restored: Value =
+            serde_json::from_slice(&decompress_json_with_store(&doc_x_call2, &store).unwrap())
+                .unwrap();
+        assert_eq!(restored, serde_json::from_str::<Value>(&doc_x).unwrap());
+
+        // Backdate ONLY inner's provenance record - doc_x was promoted
+        // later and keeps its real, recent timestamp.
+        let provenance_path = dir.join(".provenance.jsonl");
+        let contents = std::fs::read_to_string(&provenance_path).unwrap();
+        let rewritten: String = contents
+            .lines()
+            .map(|line| {
+                let mut record: Value = serde_json::from_str(line).unwrap();
+                if record.get("id").and_then(Value::as_str) == Some(inner_id.as_str()) {
+                    record["first_seen_unix"] = serde_json::json!(1000);
+                }
+                format!("{record}\n")
+            })
+            .collect();
+        std::fs::write(&provenance_path, rewritten).unwrap();
+
+        // Cutoff well after inner's backdated time, well before "now" -
+        // inner is a naive deletion candidate, doc_x (recent) is not.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        store.gc(now, false).unwrap();
+
+        // The actual check: doc_x (which GC decided to keep) must still be
+        // able to resolve, because inner - which doc_x's own stored bytes
+        // reference - must not have been deleted out from under it.
+        let result = decompress_json_with_store(&doc_x_call2, &store);
+        assert!(
+            result.is_ok(),
+            "a blob referenced by a surviving blob must not be deleted, even if it's individually old: {result:?}"
+        );
+        let restored: Value = serde_json::from_slice(&result.unwrap()).unwrap();
+        assert_eq!(restored, serde_json::from_str::<Value>(&doc_x).unwrap());
+    }
+
+    #[test]
     fn deeply_nested_repeated_document_converges_over_a_few_repeats() {
         // Locks in the convergence characteristic documented on
         // compress_json_with_store: a multi-level document doesn't
@@ -999,6 +1077,23 @@ mod tests {
                     let decompressed = decompress_json_with_store(&compressed, &store).unwrap();
                     let restored: Value = serde_json::from_slice(&decompressed).unwrap();
                     prop_assert_eq!(value, restored);
+                }
+            }
+
+            /// verify must never false-flag a view produced against a
+            /// store that's still fully intact - the property that matters
+            /// most, since a false "something's missing" would be exactly
+            /// the kind of unreliable signal that makes an integrity check
+            /// worthless.
+            #[test]
+            fn verify_never_false_flags_an_intact_store(values in prop::collection::vec(arb_json(), 1..8)) {
+                let store = temp_store();
+                for value in values {
+                    let input = serde_json::to_vec(&value).unwrap();
+                    let compressed = compress_json_with_store(&input, &store).unwrap();
+                    let result = verify_json_with_store(&compressed, &store).unwrap();
+                    prop_assert!(result.ok);
+                    prop_assert!(result.missing_refs.is_empty());
                 }
             }
         }

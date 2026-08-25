@@ -195,6 +195,20 @@ impl Store {
     /// never wired into the MCP server: an agent should not be able to
     /// delete shared, possibly-multi-tenant store content on its own
     /// initiative. It's a CLI-only, explicit, human-invoked operation.
+    ///
+    /// One thing age alone can't see: a stored blob's own bytes can
+    /// literally embed another blob's id (`json.rs`'s cross-call
+    /// interning does this - a promoted value can reference an
+    /// already-promoted child). Confirmed as a real bug, not a
+    /// theoretical one, before this protection existed: deleting an old
+    /// referenced blob while keeping a newer blob that references it left
+    /// the survivor internally broken, even though GC never touched it and
+    /// it passed its own age check. `Store` deliberately doesn't know
+    /// about any compressor's marker format, so protection here is
+    /// generic: any surviving blob's raw bytes are scanned for another
+    /// id appearing as a plain substring, and a hit protects that id
+    /// regardless of its own age - propagated to a fixed point, since a
+    /// newly-protected blob can itself reference yet another old one.
     pub fn gc(&self, older_than_unix: u64, dry_run: bool) -> std::io::Result<GcResult> {
         let provenance_path = self.root.join(".provenance.jsonl");
         let mut ages: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
@@ -212,27 +226,58 @@ impl Store {
         }
 
         let mut result = GcResult::default();
-        let mut deleted_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut sizes: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+        let mut candidates: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut survivors: Vec<String> = Vec::new();
         for entry in fs::read_dir(&self.root)? {
             let entry = entry?;
             let name = entry.file_name();
             let Some(id) = name.to_str().filter(|s| is_valid_id(s)) else {
                 continue;
             };
-            let Some(&first_seen) = ages.get(id) else {
-                result.skipped_no_provenance += 1;
-                continue;
-            };
-            if first_seen >= older_than_unix {
-                continue;
+            sizes.insert(id.to_string(), entry.metadata()?.len());
+            match ages.get(id) {
+                Some(&first_seen) if first_seen < older_than_unix => {
+                    candidates.insert(id.to_string());
+                }
+                Some(_) => survivors.push(id.to_string()),
+                None => {
+                    result.skipped_no_provenance += 1;
+                    survivors.push(id.to_string()); // no recorded age -> never eligible, always a survivor
+                }
             }
-            let size = entry.metadata()?.len();
+        }
+
+        // Fixed-point protection: scan every survivor's content for any
+        // remaining candidate id; a match protects it (removes it from
+        // candidates, adds it to the worklist so ITS content gets scanned
+        // too, since it's now a survivor in its own right).
+        let mut worklist = survivors;
+        while let Some(survivor_id) = worklist.pop() {
+            let Ok(bytes) = fs::read(self.root.join(&survivor_id)) else {
+                continue; // shouldn't happen for something we just listed, but not fatal to the sweep
+            };
+            let text = String::from_utf8_lossy(&bytes);
+            let referenced: Vec<String> = candidates
+                .iter()
+                .filter(|id| text.contains(id.as_str()))
+                .cloned()
+                .collect();
+            for id in referenced {
+                candidates.remove(&id);
+                worklist.push(id);
+            }
+        }
+
+        let mut deleted_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for id in candidates {
+            let size = *sizes.get(&id).unwrap_or(&0);
             if !dry_run {
-                fs::remove_file(entry.path())?;
+                fs::remove_file(self.root.join(&id))?;
             }
             result.deleted += 1;
             result.freed_bytes += size;
-            deleted_ids.insert(id.to_string());
+            deleted_ids.insert(id);
         }
 
         if !dry_run && !deleted_ids.is_empty() {
