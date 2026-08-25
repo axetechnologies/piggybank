@@ -6,20 +6,23 @@
 //! MCP server: `initialize`, `tools/list`, `tools/call`, and silently
 //! ignoring notifications (messages with no `id`, which get no response).
 //!
-//! Four tools. Three deliberately named to mirror headroom's own MCP
+//! Five tools. Three deliberately named to mirror headroom's own MCP
 //! surface (`headroom_compress` / `_retrieve` / `_stats`) for a direct,
-//! same-shape comparison, plus a fourth headroom's own surface doesn't
-//! expose — `boomerang_decompress`, full reconstruction rather than
-//! per-reference retrieval, since with three genuinely different marker
-//! schemes underneath, guessing which one produced a given view is a real
-//! footgun; the caller already has `kind` from `compress`, so it just asks
-//! for it back:
+//! same-shape comparison, plus two headroom's own surface doesn't expose:
 //!
 //! - `boomerang_compress` — auto-detects JSON (lossless columnar) vs
 //!   text/logs (dedup + elision); pass `key` for session-aware diffing
 //!   against whatever was last compressed under that key.
 //! - `boomerang_decompress` — full reconstruction of a compressed view,
-//!   given the `kind` `compress` returned alongside it.
+//!   given the `kind` `compress` returned alongside it. Not in headroom's
+//!   surface: with three genuinely different marker schemes underneath,
+//!   guessing which one produced a given view is a real footgun; the
+//!   caller already has `kind` from `compress`, so it just asks for it back.
+//! - `boomerang_verify` — confirm a compressed view's references still
+//!   resolve, without doing the full reconstruction `decompress` does.
+//!   Also not in headroom's surface: a lightweight integrity check
+//!   ("is this still fully reconstructable right now") that's cheaper
+//!   than a full decompress when a caller doesn't need the content itself.
 //! - `boomerang_retrieve` — fetch the exact original bytes behind a
 //!   reference id embedded in a compressed view, plus when that content
 //!   first entered the store (by any caller sharing it, not just this one).
@@ -136,6 +139,18 @@ fn tool_defs() -> Value {
             }
         },
         {
+            "name": "boomerang_verify",
+            "description": "Confirm a compressed view's references still resolve in the store, without doing the full reconstruction boomerang_decompress does - cheaper when a caller only needs to know reconstruction is still possible right now, not the content itself. Requires `kind`, same as boomerang_decompress. Returns ok, checked_refs (how many references were found and checked), and missing_refs (any that no longer resolve - empty when ok is true).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "compressed": { "type": "string", "description": "The compressed view text, exactly as returned by boomerang_compress." },
+                    "kind": { "type": "string", "description": "One of \"json\", \"text\", or \"session\" - the `kind` field from the matching boomerang_compress call." }
+                },
+                "required": ["compressed", "kind"]
+            }
+        },
+        {
             "name": "boomerang_retrieve",
             "description": "Fetch the exact original bytes behind a reference id embedded in a compressed view (e.g. the id inside a BOOMERANG:ELIDE:... marker). Nothing boomerang_compress writes to its store is ever discarded, so this always succeeds for a ref it actually returned. Response includes first_seen_unix - when this exact content first entered the store, by any caller, not just this one (null if written before provenance tracking existed).",
             "inputSchema": {
@@ -162,6 +177,7 @@ fn handle_tools_call(state: &ServerState, id: Value, request: &Value) -> Value {
     let result = match name {
         "boomerang_compress" => handle_compress(state, &arguments),
         "boomerang_decompress" => handle_decompress(state, &arguments),
+        "boomerang_verify" => handle_verify(state, &arguments),
         "boomerang_retrieve" => handle_retrieve(state, &arguments),
         "boomerang_stats" => handle_stats(state),
         other => Err(format!("unknown tool: {other}")),
@@ -261,6 +277,39 @@ fn handle_decompress(state: &ServerState, args: &Value) -> Result<Value, String>
     };
 
     Ok(json!({ "content": String::from_utf8_lossy(&restored) }))
+}
+
+fn handle_verify(state: &ServerState, args: &Value) -> Result<Value, String> {
+    let compressed = args
+        .get("compressed")
+        .and_then(Value::as_str)
+        .ok_or("missing 'compressed' argument")?;
+    let kind = args
+        .get("kind")
+        .and_then(Value::as_str)
+        .ok_or("missing 'kind' argument (one of: json, text, session)")?;
+
+    let result = match kind {
+        "json" => boomerang_core::verify_json_with_store(compressed.as_bytes(), &state.store)
+            .map_err(|e| e.to_string())?,
+        "text" => boomerang_core::verify_text_with_store(&state.store, compressed.as_bytes())
+            .map_err(|e| e.to_string())?,
+        "session" => state
+            .session
+            .verify(compressed.as_bytes())
+            .map_err(|e| e.to_string())?,
+        other => {
+            return Err(format!(
+                "unknown kind: {other} (expected json, text, or session)"
+            ))
+        }
+    };
+
+    Ok(json!({
+        "ok": result.ok,
+        "checked_refs": result.checked_refs,
+        "missing_refs": result.missing_refs,
+    }))
 }
 
 fn handle_retrieve(state: &ServerState, args: &Value) -> Result<Value, String> {

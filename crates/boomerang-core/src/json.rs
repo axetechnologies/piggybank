@@ -223,6 +223,51 @@ fn resolve_cross_call_refs(value: &Value, store: &Store) -> IoResult<Value> {
     }
 }
 
+/// Confirm every cross-call reference in a compressed view resolves in
+/// `store`, without doing the full recursive substitution
+/// `decompress_json_with_store` does - cheaper when a caller only needs to
+/// know "is this still fully reconstructable right now," not the
+/// reconstructed content itself (e.g. before a store GC pass, or as a
+/// lightweight integrity check on a view received from elsewhere). Local
+/// `__boomerang_ref__`/`__boomerang_intern__` dict indices are purely
+/// structural (checked against the dict's own length, no store involved)
+/// and aren't reported here - only store-backed references can actually go
+/// missing out from under a view.
+pub fn verify_json_with_store(input: &[u8], store: &Store) -> IoResult<crate::VerifyResult> {
+    let value: Value = serde_json::from_slice(input).map_err(json_io_err)?;
+    let mut result = crate::VerifyResult::default();
+    verify_cross_call_refs(&value, store, &mut result)?;
+    Ok(result.finish())
+}
+
+fn verify_cross_call_refs(
+    value: &Value,
+    store: &Store,
+    result: &mut crate::VerifyResult,
+) -> IoResult<()> {
+    if let Value::Object(map) = value {
+        if map.len() == 1 {
+            if let Some(id) = map.get(CROSS_CALL_REF_MARKER).and_then(Value::as_str) {
+                return result.check(store, id);
+            }
+        }
+    }
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                verify_cross_call_refs(item, store, result)?;
+            }
+        }
+        Value::Object(map) => {
+            for v in map.values() {
+                verify_cross_call_refs(v, store, result)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 /// Rename any object key starting with `RESERVED_NAMESPACE` by prepending
 /// `ESCAPE_PREFIX`, recursively, everywhere in the tree. Runs before
 /// columnarize/intern so those passes only ever see a tree where the
@@ -629,12 +674,19 @@ mod tests {
     }
 
     fn temp_store() -> crate::Store {
+        temp_store_with_dir().0
+    }
+
+    /// For the one test that needs to reach behind `Store` and delete a
+    /// file directly (simulating content going missing out from under a
+    /// view) - `Store` deliberately doesn't expose its root path itself.
+    fn temp_store_with_dir() -> (crate::Store, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!(
             "boomerang-json-store-test-{:?}-{}",
             std::time::SystemTime::now(),
             std::process::id()
         ));
-        crate::Store::open(&dir).unwrap()
+        (crate::Store::open(&dir).unwrap(), dir)
     }
 
     fn assert_round_trips_with_store(store: &crate::Store, input: &str) {
@@ -688,6 +740,55 @@ mod tests {
                 .unwrap();
         assert_eq!(restored1, serde_json::from_str::<Value>(&doc1).unwrap());
         assert_eq!(restored2, serde_json::from_str::<Value>(&doc2).unwrap());
+    }
+
+    #[test]
+    fn verify_passes_when_referenced_content_is_present() {
+        let store = temp_store();
+        let shared = format!(r#"{{"a":1,"padding":"{}"}}"#, "x".repeat(120));
+        compress_json_with_store(format!(r#"{{"v":{shared}}}"#).as_bytes(), &store).unwrap();
+        let compressed2 =
+            compress_json_with_store(format!(r#"{{"w":{shared}}}"#).as_bytes(), &store).unwrap();
+        assert!(String::from_utf8_lossy(&compressed2).contains(CROSS_CALL_REF_MARKER));
+
+        let result = verify_json_with_store(&compressed2, &store).unwrap();
+        assert!(result.ok);
+        assert_eq!(result.checked_refs, 1);
+        assert!(result.missing_refs.is_empty());
+    }
+
+    #[test]
+    fn verify_reports_missing_refs_without_erroring() {
+        // Simulates what a GC bug (or a store shared with something that
+        // deletes files it shouldn't) would look like: the reference a
+        // compressed view depends on is simply gone.
+        let (store, dir) = temp_store_with_dir();
+        let shared = format!(r#"{{"a":1,"padding":"{}"}}"#, "y".repeat(120));
+        compress_json_with_store(format!(r#"{{"v":{shared}}}"#).as_bytes(), &store).unwrap();
+        let compressed2 =
+            compress_json_with_store(format!(r#"{{"w":{shared}}}"#).as_bytes(), &store).unwrap();
+
+        let view: Value = serde_json::from_slice(&compressed2).unwrap();
+        let missing_id = view
+            .get("w")
+            .and_then(|v| v.get(CROSS_CALL_REF_MARKER))
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string();
+        std::fs::remove_file(dir.join(&missing_id)).unwrap();
+
+        let result = verify_json_with_store(&compressed2, &store).unwrap();
+        assert!(!result.ok);
+        assert_eq!(result.missing_refs, vec![missing_id]);
+    }
+
+    #[test]
+    fn verify_on_a_view_with_no_references_is_trivially_ok() {
+        let store = temp_store();
+        let compressed = compress_json_with_store(br#"{"a":1,"b":2}"#, &store).unwrap();
+        let result = verify_json_with_store(&compressed, &store).unwrap();
+        assert!(result.ok);
+        assert_eq!(result.checked_refs, 0);
     }
 
     #[test]

@@ -123,6 +123,28 @@ pub fn decompress_text(store: &Store, input: &[u8]) -> std::io::Result<Vec<u8>> 
     Ok(unescape_lines(&out.join("\n")).into_bytes())
 }
 
+/// Confirm every elided/raw span referenced by a compressed view still
+/// resolves in `store`, without reconstructing the content -
+/// `Store::exists` per reference, not `Store::get`. Cheaper than
+/// `decompress_text` when a caller only needs to know reconstruction is
+/// still possible right now.
+pub fn verify_text_with_store(store: &Store, input: &[u8]) -> std::io::Result<crate::VerifyResult> {
+    let mut result = crate::VerifyResult::default();
+    if let Some(id) = parse_raw_marker(input) {
+        result.check(store, &id)?;
+        return Ok(result.finish());
+    }
+    let Ok(text) = std::str::from_utf8(input) else {
+        return Ok(result.finish()); // shouldn't happen alongside a failed raw-marker parse, but not this function's job to report that
+    };
+    for line in text.split('\n') {
+        if let Some((_count, id)) = parse_elide(line) {
+            result.check(store, &id)?;
+        }
+    }
+    Ok(result.finish())
+}
+
 fn dedup_lines(lines: &[&str], min_repeat: usize) -> Vec<String> {
     let mut out = Vec::new();
     let mut i = 0;
@@ -192,8 +214,12 @@ mod tests {
     use super::*;
 
     fn temp_store() -> Store {
+        temp_store_with_dir().0
+    }
+
+    fn temp_store_with_dir() -> (Store, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("boomerang-text-test-{}", uuid_ish()));
-        Store::open(&dir).unwrap()
+        (Store::open(&dir).unwrap(), dir)
     }
 
     fn uuid_ish() -> String {
@@ -369,6 +395,46 @@ mod tests {
             keep_tail: 2,
         };
         assert_round_trips(&store, b"\n\n", &opts);
+    }
+
+    #[test]
+    fn verify_passes_for_a_real_elided_reference() {
+        let store = temp_store();
+        let big = (0..200)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let compressed = compress_text(&store, big.as_bytes(), &TextOptions::default()).unwrap();
+        let result = verify_text_with_store(&store, &compressed).unwrap();
+        assert!(result.ok);
+        assert_eq!(result.checked_refs, 1);
+    }
+
+    #[test]
+    fn verify_reports_missing_when_elided_content_is_deleted() {
+        let (store, dir) = temp_store_with_dir();
+        let big = (0..200)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let compressed = compress_text(&store, big.as_bytes(), &TextOptions::default()).unwrap();
+        let compressed_text = String::from_utf8(compressed.clone()).unwrap();
+        let (_, id) = compressed_text.lines().find_map(parse_elide).unwrap();
+        std::fs::remove_file(dir.join(&id)).unwrap();
+
+        let result = verify_text_with_store(&store, &compressed).unwrap();
+        assert!(!result.ok);
+        assert_eq!(result.missing_refs, vec![id]);
+    }
+
+    #[test]
+    fn verify_on_small_input_with_no_elision_is_trivially_ok() {
+        let store = temp_store();
+        let compressed =
+            compress_text(&store, b"just a few lines\nhere", &TextOptions::default()).unwrap();
+        let result = verify_text_with_store(&store, &compressed).unwrap();
+        assert!(result.ok);
+        assert_eq!(result.checked_refs, 0);
     }
 
     mod proptests {

@@ -37,7 +37,7 @@ content-addressed, atomically-written, crash-safe, *provably* reversible
 blob store — compress/decompress round-trips are tested exhaustively
 (proptest fuzzing, verified against the real binary, not just asserted),
 not approximated the way headroom's ML-based CCR caching is. That primitive
-is worth more than the compression it happens to enable. Two consequences
+is worth more than the compression it happens to enable. Three consequences
 of it, proven not just designed:
 
 - **Shared memory across agents that never coordinate.** `Store` is just
@@ -57,6 +57,14 @@ of it, proven not just designed:
   `first_seen_unix` field — regardless of which caller originally wrote it.
   "What did any agent see, and when" becomes an answerable question instead
   of something lost the moment content gets compressed away.
+- **Integrity verification without full reconstruction.** `boomerang_verify`
+  walks a compressed view's reference chain and confirms every id still
+  resolves in the store — `Store::exists` (a stat), not `Store::get` (a
+  read) — reporting exactly which references are missing rather than
+  failing outright. Cheaper than a full `boomerang_decompress` when a
+  caller only needs "is this still fully reconstructable right now," not
+  the content itself: a lightweight audit/integrity primitive, not just a
+  compression optimization.
 
 ## Design
 

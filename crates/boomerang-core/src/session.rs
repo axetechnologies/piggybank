@@ -163,6 +163,26 @@ impl Session {
 
         Ok(unescape_lines(text).into_bytes())
     }
+
+    /// Confirm the previous version a compressed view depends on (an
+    /// UNCHANGED or DIFF marker's referenced id) still resolves in the
+    /// store, without replaying the diff or fetching the full content -
+    /// `Store::exists`, not `Store::get`. First-sight passthrough views
+    /// reference nothing and always verify clean.
+    pub fn verify(&self, compressed: &[u8]) -> io::Result<crate::VerifyResult> {
+        let mut result = crate::VerifyResult::default();
+        let Ok(text) = std::str::from_utf8(compressed) else {
+            return Ok(result.finish());
+        };
+        if let Some(id) = strip_pua(text, "BOOMERANG:UNCHANGED:") {
+            result.check(&self.store, id)?;
+        } else if let Some((first, _rest)) = text.split_once('\n') {
+            if let Some(prev_id) = strip_pua(first, "BOOMERANG:DIFF:") {
+                result.check(&self.store, prev_id)?;
+            }
+        }
+        Ok(result.finish())
+    }
 }
 
 /// Escape `content`'s lines for use as a compressed view, if it's UTF-8
@@ -502,6 +522,40 @@ mod tests {
 
         let restored = session.decompress(&compressed).unwrap();
         assert_eq!(restored, new.into_bytes());
+    }
+
+    #[test]
+    fn verify_passes_for_unchanged_and_diff_markers() {
+        let session = Session::new(temp_store());
+        let original = (0..20)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        session.compress("f.txt", original.as_bytes()).unwrap();
+
+        // Identical re-read -> UNCHANGED marker.
+        let unchanged_view = session.compress("f.txt", original.as_bytes()).unwrap();
+        let result = session.verify(&unchanged_view).unwrap();
+        assert!(result.ok);
+        assert_eq!(result.checked_refs, 1);
+
+        // Real edit -> DIFF marker.
+        let edited = format!("{original}\none more line");
+        let diff_view = session.compress("f.txt", edited.as_bytes()).unwrap();
+        let result = session.verify(&diff_view).unwrap();
+        assert!(result.ok);
+        assert_eq!(result.checked_refs, 1);
+    }
+
+    #[test]
+    fn verify_on_first_sight_is_trivially_ok() {
+        let session = Session::new(temp_store());
+        let view = session
+            .compress("new-key.txt", b"never seen before")
+            .unwrap();
+        let result = session.verify(&view).unwrap();
+        assert!(result.ok);
+        assert_eq!(result.checked_refs, 0);
     }
 
     mod proptests {

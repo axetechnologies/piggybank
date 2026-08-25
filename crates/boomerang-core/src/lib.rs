@@ -8,9 +8,10 @@ mod session;
 mod text;
 pub use json::{
     compress_json, compress_json_with_store, decompress_json, decompress_json_with_store,
+    verify_json_with_store,
 };
 pub use session::Session;
-pub use text::{compress_text, decompress_text, TextOptions};
+pub use text::{compress_text, decompress_text, verify_text_with_store, TextOptions};
 
 /// Content-addressed blob store. Every write is keyed by the sha256 of its
 /// bytes, so writing the same content twice is a no-op and nothing already
@@ -140,6 +141,20 @@ impl Store {
         fs::read(self.root.join(id))
     }
 
+    /// Check whether `id` is present, without reading its content - a
+    /// filesystem stat, not a read. Cheaper than `get` for a caller that
+    /// only needs to confirm reachability, not the bytes themselves - see
+    /// `VerifyResult`, which is built entirely on this instead of `get`.
+    pub fn exists(&self, id: &str) -> std::io::Result<bool> {
+        if !is_valid_id(id) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid content id",
+            ));
+        }
+        Ok(self.root.join(id).exists())
+    }
+
     /// Count entries and total bytes actually held in the store. Filters to
     /// files whose names look like our sha256-hex ids so sidecar files
     /// living in the same directory (e.g. `Session`'s `.session.json`)
@@ -171,6 +186,36 @@ fn is_valid_id(id: &str) -> bool {
 pub struct StoreStats {
     pub entries: usize,
     pub bytes: u64,
+}
+
+/// Result of checking a compressed view's reference chain against a store,
+/// without fully decompressing it. Every one of the three compressors'
+/// `verify` functions builds this the same way: walk the view for
+/// store-backed reference markers, `Store::exists` each one (a stat, not a
+/// read), and report what's missing rather than failing outright - a
+/// caller can decide whether a few missing refs matter for what it's about
+/// to do (e.g. a GC dry run) versus needing everything present (e.g. about
+/// to promise a client full reconstruction is possible).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VerifyResult {
+    pub ok: bool,
+    pub checked_refs: usize,
+    pub missing_refs: Vec<String>,
+}
+
+impl VerifyResult {
+    pub(crate) fn check(&mut self, store: &Store, id: &str) -> std::io::Result<()> {
+        self.checked_refs += 1;
+        if !store.exists(id)? {
+            self.missing_refs.push(id.to_string());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn finish(mut self) -> Self {
+        self.ok = self.missing_refs.is_empty();
+        self
+    }
 }
 
 #[cfg(test)]
@@ -311,6 +356,25 @@ mod tests {
         let result = store.first_seen("../../../etc/passwd");
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn exists_matches_get_availability_and_rejects_invalid_ids() {
+        let dir =
+            std::env::temp_dir().join(format!("boomerang-exists-test-{}", std::process::id()));
+        let store = Store::open(&dir).unwrap();
+
+        let never_written = "b".repeat(64);
+        assert!(!store.exists(&never_written).unwrap());
+
+        let id = store.put(b"exists check").unwrap();
+        assert!(store.exists(&id).unwrap());
+
+        let result = store.exists("../../../etc/passwd");
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+
         fs::remove_dir_all(&dir).ok();
     }
 }
