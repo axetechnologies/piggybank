@@ -6,27 +6,26 @@
 //! MCP server: `initialize`, `tools/list`, `tools/call`, and silently
 //! ignoring notifications (messages with no `id`, which get no response).
 //!
-//! Five tools. Three deliberately named to mirror headroom's own MCP
-//! surface (`headroom_compress` / `_retrieve` / `_stats`) for a direct,
-//! same-shape comparison, plus two headroom's own surface doesn't expose:
+//! Five tools, named as clean verbs — the MCP server name already
+//! provides the namespace (`mcp__boomerang__compress`, etc.):
 //!
-//! - `boomerang_compress` — auto-detects JSON (lossless columnar) vs
+//! - `compress` — auto-detects JSON (lossless columnar) vs
 //!   text/logs (dedup + elision); pass `key` for session-aware diffing
 //!   against whatever was last compressed under that key.
-//! - `boomerang_decompress` — full reconstruction of a compressed view,
+//! - `decompress` — full reconstruction of a compressed view,
 //!   given the `kind` `compress` returned alongside it. Not in headroom's
 //!   surface: with three genuinely different marker schemes underneath,
 //!   guessing which one produced a given view is a real footgun; the
 //!   caller already has `kind` from `compress`, so it just asks for it back.
-//! - `boomerang_verify` — confirm a compressed view's references still
+//! - `verify` — confirm a compressed view's references still
 //!   resolve, without doing the full reconstruction `decompress` does.
 //!   Also not in headroom's surface: a lightweight integrity check
 //!   ("is this still fully reconstructable right now") that's cheaper
 //!   than a full decompress when a caller doesn't need the content itself.
-//! - `boomerang_retrieve` — fetch the exact original bytes behind a
+//! - `retrieve` — fetch the exact original bytes behind a
 //!   reference id embedded in a compressed view, plus when that content
 //!   first entered the store (by any caller sharing it, not just this one).
-//! - `boomerang_stats` — entry count and total bytes held in the store.
+//! - `stats` — entry count and total bytes held in the store.
 
 use boomerang_core::{Session, Store, TextOptions};
 use serde_json::{json, Value};
@@ -115,8 +114,8 @@ fn initialize_result() -> Value {
 fn tool_defs() -> Value {
     json!([
         {
-            "name": "boomerang_compress",
-            "description": "Compress content before it reaches an LLM. Auto-detects JSON (lossless columnar compression: repeated keys/values in arrays-of-objects amortized) vs text/logs (consecutive-line dedup + middle elision for large blocks, exact recovery via boomerang_retrieve). Pass `key` (e.g. a file path) to diff against whatever was last compressed under that same key in this session, instead of resending it in full.",
+            "name": "compress",
+            "description": "Compress content before it reaches an LLM. Auto-detects JSON (lossless columnar compression: repeated keys/values in arrays-of-objects amortized) vs text/logs (consecutive-line dedup + middle elision for large blocks, exact recovery via retrieve). Pass `key` (e.g. a file path) to diff against whatever was last compressed under that same key in this session, instead of resending it in full.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -127,32 +126,32 @@ fn tool_defs() -> Value {
             }
         },
         {
-            "name": "boomerang_decompress",
-            "description": "Reconstruct the exact original content from a compressed view returned by boomerang_compress. Requires `kind` (the value boomerang_compress returned alongside `compressed`) since the three compressors use distinct, non-overlapping marker schemes and guessing which one produced a given view is unreliable in the general case - pass back what compress told you.",
+            "name": "decompress",
+            "description": "Reconstruct the exact original content from a compressed view returned by compress. Requires `kind` (the value compress returned alongside `compressed`) since the three compressors use distinct, non-overlapping marker schemes and guessing which one produced a given view is unreliable in the general case - pass back what compress told you.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "compressed": { "type": "string", "description": "The compressed view text, exactly as returned by boomerang_compress." },
-                    "kind": { "type": "string", "description": "One of \"json\", \"text\", or \"session\" - the `kind` field from the matching boomerang_compress call." }
+                    "compressed": { "type": "string", "description": "The compressed view text, exactly as returned by compress." },
+                    "kind": { "type": "string", "description": "One of \"json\", \"text\", or \"session\" - the `kind` field from the matching compress call." }
                 },
                 "required": ["compressed", "kind"]
             }
         },
         {
-            "name": "boomerang_verify",
-            "description": "Confirm a compressed view's references still resolve in the store, without doing the full reconstruction boomerang_decompress does - cheaper when a caller only needs to know reconstruction is still possible right now, not the content itself. Requires `kind`, same as boomerang_decompress. Returns ok, checked_refs (how many references were found and checked), and missing_refs (any that no longer resolve - empty when ok is true).",
+            "name": "verify",
+            "description": "Confirm a compressed view's references still resolve in the store, without doing the full reconstruction decompress does - cheaper when a caller only needs to know reconstruction is still possible right now, not the content itself. Requires `kind`, same as decompress. Returns ok, checked_refs (how many references were found and checked), and missing_refs (any that no longer resolve - empty when ok is true).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "compressed": { "type": "string", "description": "The compressed view text, exactly as returned by boomerang_compress." },
-                    "kind": { "type": "string", "description": "One of \"json\", \"text\", or \"session\" - the `kind` field from the matching boomerang_compress call." }
+                    "compressed": { "type": "string", "description": "The compressed view text, exactly as returned by compress." },
+                    "kind": { "type": "string", "description": "One of \"json\", \"text\", or \"session\" - the `kind` field from the matching compress call." }
                 },
                 "required": ["compressed", "kind"]
             }
         },
         {
-            "name": "boomerang_retrieve",
-            "description": "Fetch the exact original bytes behind a reference id embedded in a compressed view (e.g. the id inside a BOOMERANG:ELIDE:... marker). Nothing boomerang_compress writes to its store is ever discarded, so this always succeeds for a ref it actually returned. Response includes first_seen_unix - when this exact content first entered the store, by any caller, not just this one (null if written before provenance tracking existed).",
+            "name": "retrieve",
+            "description": "Fetch the exact original bytes behind a reference id embedded in a compressed view (e.g. the id inside a BOOMERANG:ELIDE:... marker). Nothing compress writes to its store is ever discarded, so this always succeeds for a ref it actually returned. Response includes first_seen_unix - when this exact content first entered the store, by any caller, not just this one (null if written before provenance tracking existed).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -162,7 +161,7 @@ fn tool_defs() -> Value {
             }
         },
         {
-            "name": "boomerang_stats",
+            "name": "stats",
             "description": "Report how many entries and how many bytes are currently held in the content store.",
             "inputSchema": { "type": "object", "properties": {} }
         },
@@ -175,11 +174,11 @@ fn handle_tools_call(state: &ServerState, id: Value, request: &Value) -> Value {
     let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
 
     let result = match name {
-        "boomerang_compress" => handle_compress(state, &arguments),
-        "boomerang_decompress" => handle_decompress(state, &arguments),
-        "boomerang_verify" => handle_verify(state, &arguments),
-        "boomerang_retrieve" => handle_retrieve(state, &arguments),
-        "boomerang_stats" => handle_stats(state),
+        "compress" => handle_compress(state, &arguments),
+        "decompress" => handle_decompress(state, &arguments),
+        "verify" => handle_verify(state, &arguments),
+        "retrieve" => handle_retrieve(state, &arguments),
+        "stats" => handle_stats(state),
         other => Err(format!("unknown tool: {other}")),
     };
 
