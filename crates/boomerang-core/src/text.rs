@@ -145,6 +145,50 @@ pub fn verify_text_with_store(store: &Store, input: &[u8]) -> std::io::Result<cr
     Ok(result.finish())
 }
 
+/// Budget-constrained compression: fit text into at most `max_bytes`
+/// while maximizing information density. Tries normal compression first;
+/// if the result exceeds the budget, forces elision and progressively
+/// shrinks the kept head/tail until the view fits. Elided content is
+/// always stored for recovery via `retrieve`.
+///
+/// Returns the same format as `compress_text` — `decompress_text` works
+/// unchanged. The only difference is the *amount* elided, which is
+/// driven by the budget rather than fixed thresholds.
+///
+/// Non-UTF-8 input stores the whole blob and returns a raw marker;
+/// no further shrinking is possible without understanding the format.
+pub fn compress_text_budget(
+    store: &Store,
+    input: &[u8],
+    max_bytes: usize,
+) -> std::io::Result<Vec<u8>> {
+    let normal = compress_text(store, input, &TextOptions::default())?;
+    if normal.len() <= max_bytes {
+        return Ok(normal);
+    }
+
+    if std::str::from_utf8(input).is_err() {
+        return Ok(normal);
+    }
+
+    let mut head = 15usize;
+    let mut tail = 10usize;
+    loop {
+        let opts = TextOptions {
+            dedup_min_repeat: 3,
+            elide_threshold_lines: 1,
+            keep_head: head,
+            keep_tail: tail,
+        };
+        let compressed = compress_text(store, input, &opts)?;
+        if compressed.len() <= max_bytes || (head == 0 && tail == 0) {
+            return Ok(compressed);
+        }
+        head /= 2;
+        tail /= 2;
+    }
+}
+
 fn dedup_lines(lines: &[&str], min_repeat: usize) -> Vec<String> {
     let mut out = Vec::new();
     let mut i = 0;
@@ -425,6 +469,54 @@ mod tests {
         let result = verify_text_with_store(&store, &compressed).unwrap();
         assert!(!result.ok);
         assert_eq!(result.missing_refs, vec![id]);
+    }
+
+    #[test]
+    fn budget_returns_normal_when_it_fits() {
+        let store = temp_store();
+        let input = "short\nlog\noutput";
+        let normal = compress_text(&store, input.as_bytes(), &TextOptions::default()).unwrap();
+        let budget = compress_text_budget(&store, input.as_bytes(), 10_000).unwrap();
+        assert_eq!(budget, normal);
+    }
+
+    #[test]
+    fn budget_shrinks_to_fit() {
+        let store = temp_store();
+        let input: String = (0..500)
+            .map(|i| format!("log line {i} with some payload data"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let budget = 500;
+        let compressed = compress_text_budget(&store, input.as_bytes(), budget).unwrap();
+        assert!(
+            compressed.len() <= budget,
+            "must fit within budget: {} vs {budget}",
+            compressed.len()
+        );
+        let restored = decompress_text(&store, &compressed).unwrap();
+        assert_eq!(restored, input.as_bytes(), "must still round-trip exactly");
+    }
+
+    #[test]
+    fn budget_extreme_shrink_still_round_trips() {
+        let store = temp_store();
+        let input: String = (0..1000)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let compressed = compress_text_budget(&store, input.as_bytes(), 200).unwrap();
+        let restored = decompress_text(&store, &compressed).unwrap();
+        assert_eq!(restored, input.as_bytes());
+    }
+
+    #[test]
+    fn budget_non_utf8_returns_raw_marker() {
+        let store = temp_store();
+        let input: &[u8] = &[0xff, 0xfe, 0x00, 0x01];
+        let compressed = compress_text_budget(&store, input, 2).unwrap();
+        let restored = decompress_text(&store, &compressed).unwrap();
+        assert_eq!(restored, input);
     }
 
     #[test]

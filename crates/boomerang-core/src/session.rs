@@ -184,6 +184,42 @@ impl Session {
         Ok(result.finish())
     }
 
+    /// Append-only compression: the caller sends only *new* bytes, and
+    /// Boomerang concatenates them with whatever was last stored under
+    /// `key`. The full accumulated content is written to the store (so
+    /// a future `compress` or `decompress` against this key sees
+    /// everything), but the returned view contains only the new bytes
+    /// — the caller already has the prior content in context and
+    /// doesn't need it resent.
+    ///
+    /// First call under a key behaves identically to `compress` with
+    /// no prior state: the new content IS the full content.
+    ///
+    /// The separator between old and new content is `\n` — append is
+    /// a line-oriented operation (logs, build output, streaming
+    /// results). Non-line-oriented content should use `compress` with
+    /// session diffing instead.
+    pub fn append(&self, key: &str, new_content: &[u8]) -> io::Result<Vec<u8>> {
+        let previous_id = self.last_seen.borrow().get(key).cloned();
+        let full = match previous_id {
+            Some(prev_id) => {
+                let mut old = self.store.get(&prev_id)?;
+                if !old.is_empty() && !new_content.is_empty() {
+                    old.push(b'\n');
+                }
+                old.extend_from_slice(new_content);
+                old
+            }
+            None => new_content.to_vec(),
+        };
+        let new_id = self.store.put(&full)?;
+        self.last_seen
+            .borrow_mut()
+            .insert(key.to_string(), new_id);
+        self.persist()?;
+        Ok(escape_for_view(new_content))
+    }
+
     /// Check whether the content last compressed under `key` matches a
     /// caller-supplied sha256 hex hash, without the caller needing to
     /// resend the content itself. Returns `(changed, known)`:
@@ -369,7 +405,7 @@ fn parse_diff(text: &str) -> Option<Vec<DiffOp>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sha2::{Digest, Sha256};
+    use sha2::Digest;
 
     fn temp_store() -> Store {
         let dir = std::env::temp_dir().join(format!(
@@ -614,6 +650,61 @@ mod tests {
     }
 
     #[test]
+    fn append_first_call_stores_and_returns_content() {
+        let session = Session::new(temp_store());
+        let view = session.append("build.log", b"line 1\nline 2").unwrap();
+        assert_eq!(view, b"line 1\nline 2");
+    }
+
+    #[test]
+    fn append_accumulates_across_calls() {
+        let session = Session::new(temp_store());
+        session.append("build.log", b"line 1").unwrap();
+        let view2 = session.append("build.log", b"line 2").unwrap();
+        assert_eq!(view2, b"line 2", "only the new bytes are returned");
+
+        let view3 = session.append("build.log", b"line 3").unwrap();
+        assert_eq!(view3, b"line 3");
+
+        // The full accumulated content is accessible via compress+decompress.
+        let full_view = session.compress("build.log", b"line 1\nline 2\nline 3").unwrap();
+        let full_text = String::from_utf8_lossy(&full_view);
+        assert!(
+            full_text.contains("UNCHANGED"),
+            "accumulated content should match, producing an UNCHANGED marker"
+        );
+    }
+
+    #[test]
+    fn append_with_empty_new_content_does_not_add_separator() {
+        let session = Session::new(temp_store());
+        session.append("f.log", b"first").unwrap();
+        session.append("f.log", b"").unwrap();
+
+        // Verify the stored content is just "first" (no trailing newline).
+        let unchanged = session.compress("f.log", b"first").unwrap();
+        let text = String::from_utf8_lossy(&unchanged);
+        assert!(text.contains("UNCHANGED"));
+    }
+
+    #[test]
+    fn append_escapes_marker_looking_content() {
+        let session = Session::new(temp_store());
+        let tricky = format!("{PUA}BOOMERANG:UNCHANGED:deadbeef{PUA}");
+        let view = session.append("f.log", tricky.as_bytes()).unwrap();
+        // The returned view must be escaped so it won't be misinterpreted.
+        assert_ne!(view, tricky.as_bytes(), "marker-like content must be escaped");
+    }
+
+    #[test]
+    fn append_different_keys_are_independent() {
+        let session = Session::new(temp_store());
+        session.append("a.log", b"alpha").unwrap();
+        let view = session.append("b.log", b"beta").unwrap();
+        assert_eq!(view, b"beta", "b.log should have no prior content");
+    }
+
+    #[test]
     fn check_changed_rejects_invalid_hashes() {
         let session = Session::new(temp_store());
         session.compress("f.txt", b"content").unwrap();
@@ -669,6 +760,32 @@ mod tests {
                     let restored = session.decompress(&compressed).unwrap();
                     prop_assert_eq!(restored, content.into_bytes());
                 }
+            }
+
+            /// Append accumulates content correctly: after N appends,
+            /// the stored content under the key must equal all chunks
+            /// joined by newline separators, and compress against that
+            /// full content must return UNCHANGED.
+            #[test]
+            fn append_accumulates_correctly(
+                chunks in prop::collection::vec(arb_content(), 1..8)
+            ) {
+                let session = Session::new(temp_store());
+                let key = "stream.log";
+                let mut expected = String::new();
+                for (i, chunk) in chunks.iter().enumerate() {
+                    if i > 0 && !expected.is_empty() && !chunk.is_empty() {
+                        expected.push('\n');
+                    }
+                    expected.push_str(chunk);
+                    session.append(key, chunk.as_bytes()).unwrap();
+                }
+                let view = session.compress(key, expected.as_bytes()).unwrap();
+                let text = String::from_utf8(view).unwrap();
+                prop_assert!(
+                    text.contains("UNCHANGED") || chunks.iter().all(|c| c.is_empty()),
+                    "accumulated content must match what compress sees"
+                );
             }
 
             /// Same property as json.rs's/text.rs's: verify must never

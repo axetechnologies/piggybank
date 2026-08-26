@@ -11,7 +11,9 @@ pub use json::{
     verify_json_with_store,
 };
 pub use session::Session;
-pub use text::{compress_text, decompress_text, verify_text_with_store, TextOptions};
+pub use text::{
+    compress_text, compress_text_budget, decompress_text, verify_text_with_store, TextOptions,
+};
 
 /// Content-addressed blob store. Every write is keyed by the sha256 of its
 /// bytes, so writing the same content twice is a no-op and nothing already

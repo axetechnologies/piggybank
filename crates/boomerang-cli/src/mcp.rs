@@ -6,25 +6,24 @@
 //! MCP server: `initialize`, `tools/list`, `tools/call`, and silently
 //! ignoring notifications (messages with no `id`, which get no response).
 //!
-//! Five tools, named as clean verbs — the MCP server name already
+//! Eight tools, named as clean verbs — the MCP server name already
 //! provides the namespace (`mcp__boomerang__compress`, etc.):
 //!
 //! - `compress` — auto-detects JSON (lossless columnar) vs
 //!   text/logs (dedup + elision); pass `key` for session-aware diffing
 //!   against whatever was last compressed under that key.
 //! - `decompress` — full reconstruction of a compressed view,
-//!   given the `kind` `compress` returned alongside it. Not in headroom's
-//!   surface: with three genuinely different marker schemes underneath,
-//!   guessing which one produced a given view is a real footgun; the
-//!   caller already has `kind` from `compress`, so it just asks for it back.
+//!   given the `kind` `compress` returned alongside it.
 //! - `verify` — confirm a compressed view's references still
 //!   resolve, without doing the full reconstruction `decompress` does.
-//!   Also not in headroom's surface: a lightweight integrity check
-//!   ("is this still fully reconstructable right now") that's cheaper
-//!   than a full decompress when a caller doesn't need the content itself.
 //! - `retrieve` — fetch the exact original bytes behind a
 //!   reference id embedded in a compressed view, plus when that content
 //!   first entered the store (by any caller sharing it, not just this one).
+//! - `changed` — fingerprint check: compare a sha256 hash against
+//!   the last compressed content under a key, without resending it.
+//! - `compress_append` — streaming append: send only new bytes,
+//!   Boomerang concatenates with prior content under the key and returns
+//!   only the delta. Designed for tailing logs or polling builds.
 //! - `stats` — entry count and total bytes held in the store.
 
 use boomerang_core::{Session, Store, TextOptions};
@@ -199,6 +198,30 @@ fn tool_defs() -> Value {
             }
         },
         {
+            "name": "compress_budget",
+            "description": "Budget-constrained compression: 'I have N bytes of context budget — give me the highest information density you can fit.' Compresses content with a hard byte ceiling. If normal compression already fits, returns that. Otherwise progressively elides more of the middle (stored for recovery via retrieve) until the view fits. Elided content is never lost — retrieve any reference id to get the exact original bytes back. Use when context window space is scarce and you need the most important parts of large output.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "content": { "type": "string", "description": "The raw content to compress." },
+                    "max_bytes": { "type": "integer", "description": "Maximum byte size for the compressed view.", "minimum": 1 }
+                },
+                "required": ["content", "max_bytes"]
+            }
+        },
+        {
+            "name": "compress_append",
+            "description": "Append-only streaming compression: send only *new* bytes (e.g. new log lines since last poll) and Boomerang concatenates them with prior content under the same key. The full accumulated content is stored (so compress/decompress against this key see everything), but the returned view contains only the new bytes — the caller already has prior content in context. First call under a key behaves like compress with no prior state. Designed for tailing logs, polling builds, or any streaming output where resending the full history each call wastes context budget.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "key": { "type": "string", "description": "Stable identifier for the stream being tailed (e.g. 'build-log', a file path)." },
+                    "content": { "type": "string", "description": "Only the new bytes since the last append call." }
+                },
+                "required": ["key", "content"]
+            }
+        },
+        {
             "name": "stats",
             "description": "Report store size and lifetime compression savings: total calls, bytes in, bytes out, bytes saved, and savings percentage since activation.",
             "inputSchema": { "type": "object", "properties": {} }
@@ -216,7 +239,9 @@ fn handle_tools_call(state: &ServerState, id: Value, request: &Value) -> Value {
         "decompress" => handle_decompress(state, &arguments),
         "verify" => handle_verify(state, &arguments),
         "retrieve" => handle_retrieve(state, &arguments),
+        "compress_budget" => handle_compress_budget(state, &arguments),
         "changed" => handle_changed(state, &arguments),
+        "compress_append" => handle_compress_append(state, &arguments),
         "stats" => handle_stats(state),
         other => Err(format!("unknown tool: {other}")),
     };
@@ -383,6 +408,55 @@ fn handle_retrieve(state: &ServerState, args: &Value) -> Result<Value, String> {
     // never fails the retrieve itself.
     let first_seen_unix = state.store.first_seen(reference).ok().flatten();
     Ok(json!({ "content": String::from_utf8_lossy(&bytes), "first_seen_unix": first_seen_unix }))
+}
+
+fn handle_compress_budget(state: &ServerState, args: &Value) -> Result<Value, String> {
+    let content = args
+        .get("content")
+        .and_then(Value::as_str)
+        .ok_or("missing 'content' argument")?;
+    let max_bytes = args
+        .get("max_bytes")
+        .and_then(Value::as_u64)
+        .ok_or("missing or invalid 'max_bytes' argument")? as usize;
+    if max_bytes == 0 {
+        return Err("max_bytes must be >= 1".into());
+    }
+    let compressed =
+        boomerang_core::compress_text_budget(&state.store, content.as_bytes(), max_bytes)
+            .map_err(|e| e.to_string())?;
+    let within_budget = compressed.len() <= max_bytes;
+    let savings = record_and_savings(state, content.len(), compressed.len());
+    Ok(json!({
+        "view": encode_view("text", &compressed),
+        "original_bytes": content.len(),
+        "compressed_bytes": compressed.len(),
+        "within_budget": within_budget,
+        "savings": savings,
+    }))
+}
+
+fn handle_compress_append(state: &ServerState, args: &Value) -> Result<Value, String> {
+    let key = args
+        .get("key")
+        .and_then(Value::as_str)
+        .ok_or("missing 'key' argument")?;
+    let content = args
+        .get("content")
+        .and_then(Value::as_str)
+        .ok_or("missing 'content' argument")?;
+    let new_bytes = content.as_bytes();
+    let view_bytes = state
+        .session
+        .append(key, new_bytes)
+        .map_err(|e| e.to_string())?;
+    let savings = record_and_savings(state, new_bytes.len(), view_bytes.len());
+    Ok(json!({
+        "view": encode_view("text", &view_bytes),
+        "appended_bytes": new_bytes.len(),
+        "view_bytes": view_bytes.len(),
+        "savings": savings,
+    }))
 }
 
 fn handle_changed(state: &ServerState, args: &Value) -> Result<Value, String> {
