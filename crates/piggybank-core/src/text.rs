@@ -168,26 +168,109 @@ pub fn compress_text_budget(
         return Ok(normal);
     }
 
-    if std::str::from_utf8(input).is_err() {
+    let text = match std::str::from_utf8(input) {
+        Ok(t) => t,
+        Err(_) => return Ok(normal),
+    };
+
+    let escaped = escape_lines(text);
+    let lines: Vec<&str> = escaped.split('\n').collect();
+    let n = lines.len();
+    if n == 0 {
         return Ok(normal);
     }
 
-    let mut head = 15usize;
-    let mut tail = 10usize;
+    let scores: Vec<u32> = lines.iter().map(|l| line_anomaly_score(l)).collect();
+    let mut ranked: Vec<usize> = (0..n).collect();
+    ranked.sort_by(|&a, &b| scores[b].cmp(&scores[a]).then(a.cmp(&b)));
+
+    let mut keep_count = n / 2;
     loop {
-        let opts = TextOptions {
-            dedup_min_repeat: 3,
-            elide_threshold_lines: 1,
-            keep_head: head,
-            keep_tail: tail,
-        };
-        let compressed = compress_text(store, input, &opts)?;
-        if compressed.len() <= max_bytes || (head == 0 && tail == 0) {
+        let mut keep = vec![false; n];
+        keep[0] = true;
+        if n > 1 {
+            keep[n - 1] = true;
+        }
+        let mut filled = 1 + usize::from(n > 1);
+        for &idx in &ranked {
+            if filled >= keep_count {
+                break;
+            }
+            if !keep[idx] {
+                keep[idx] = true;
+                filled += 1;
+            }
+        }
+
+        let compressed = build_anomaly_view(store, &lines, &keep)?;
+        if compressed.len() <= max_bytes || keep_count == 0 {
             return Ok(compressed);
         }
-        head /= 2;
-        tail /= 2;
+        keep_count /= 2;
     }
+}
+
+fn line_anomaly_score(line: &str) -> u32 {
+    let lower = line.to_ascii_lowercase();
+    let mut score = 1u32;
+    for kw in &["error", "fatal", "panic", "exception", "critical"] {
+        if lower.contains(kw) {
+            score += 10;
+            break;
+        }
+    }
+    for kw in &["warn", "warning"] {
+        if lower.contains(kw) {
+            score += 5;
+            break;
+        }
+    }
+    for kw in &[
+        "fail", "denied", "refused", "timeout", "crash", "abort", "killed",
+    ] {
+        if lower.contains(kw) {
+            score += 8;
+            break;
+        }
+    }
+    if line.len() > 200 {
+        score += 2;
+    }
+    score
+}
+
+fn build_anomaly_view(
+    store: &Store,
+    lines: &[&str],
+    keep: &[bool],
+) -> std::io::Result<Vec<u8>> {
+    let mut out: Vec<String> = Vec::new();
+    let mut gap_start: Option<usize> = None;
+
+    for (i, &line) in lines.iter().enumerate() {
+        if keep[i] {
+            if let Some(start) = gap_start.take() {
+                let gap: Vec<&str> = lines[start..i].to_vec();
+                if !gap.is_empty() {
+                    let id = store.put(gap.join("\n").as_bytes())?;
+                    out.push(elide_marker(gap.len(), &id));
+                }
+            }
+            out.push(line.to_string());
+        } else if gap_start.is_none() {
+            gap_start = Some(i);
+        }
+    }
+
+    if let Some(start) = gap_start {
+        let gap: Vec<&str> = lines[start..].to_vec();
+        if !gap.is_empty() {
+            let id = store.put(gap.join("\n").as_bytes())?;
+            out.push(elide_marker(gap.len(), &id));
+        }
+    }
+
+    Ok(dedup_scattered(out).join("\n").into_bytes())
 }
 
 fn dedup_lines(lines: &[&str], min_repeat: usize) -> Vec<String> {
@@ -548,6 +631,38 @@ mod tests {
         let compressed = compress_text_budget(&store, input.as_bytes(), 200).unwrap();
         let restored = decompress_text(&store, &compressed).unwrap();
         assert_eq!(restored, input.as_bytes());
+    }
+
+    #[test]
+    fn budget_prefers_error_lines_over_normal_lines() {
+        let store = temp_store();
+        let mut lines: Vec<String> = Vec::new();
+        for i in 0..200 {
+            lines.push(format!("2024-01-15T10:00:{:02}Z INFO: healthcheck passed, latency={}ms", i % 60, 2 + i));
+        }
+        lines[50] = "2024-01-15T10:00:50Z ERROR: database connection timeout after 30s, all retries exhausted".to_string();
+        lines[120] = "2024-01-15T10:02:00Z FATAL: out of memory, heap dump written to /tmp/heap.hprof".to_string();
+        lines[180] = "2024-01-15T10:03:00Z WARN: request queue depth exceeds threshold, applying backpressure".to_string();
+        let input = lines.join("\n");
+
+        let budget = 800;
+        let compressed = compress_text_budget(&store, input.as_bytes(), budget).unwrap();
+        assert!(
+            compressed.len() <= budget,
+            "must fit budget: {} vs {budget}",
+            compressed.len()
+        );
+        let compressed_text = String::from_utf8(compressed.clone()).unwrap();
+        assert!(
+            compressed_text.contains("ERROR: database connection timeout"),
+            "error line must survive budget truncation"
+        );
+        assert!(
+            compressed_text.contains("FATAL: out of memory"),
+            "fatal line must survive budget truncation"
+        );
+        let restored = decompress_text(&store, &compressed).unwrap();
+        assert_eq!(restored, input.as_bytes(), "must still round-trip exactly");
     }
 
     #[test]
