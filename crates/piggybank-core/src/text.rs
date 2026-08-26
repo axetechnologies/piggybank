@@ -1,5 +1,6 @@
 use crate::markers::{escape_lines, strip_pua, unescape_lines, PUA};
 use crate::Store;
+use std::collections::HashMap;
 
 #[derive(Clone, Copy, Debug)]
 pub struct TextOptions {
@@ -64,9 +65,8 @@ pub fn compress_text(store: &Store, input: &[u8], opts: &TextOptions) -> std::io
     let lines: Vec<&str> = escaped.split('\n').collect();
 
     if lines.len() <= opts.elide_threshold_lines {
-        return Ok(dedup_lines(&lines, opts.dedup_min_repeat)
-            .join("\n")
-            .into_bytes());
+        let deduped = dedup_lines(&lines, opts.dedup_min_repeat);
+        return Ok(dedup_scattered(deduped).join("\n").into_bytes());
     }
 
     let keep_head = opts.keep_head.min(lines.len());
@@ -77,15 +77,11 @@ pub fn compress_text(store: &Store, input: &[u8], opts: &TextOptions) -> std::io
 
     let mut out = dedup_lines(head, opts.dedup_min_repeat);
     if !middle.is_empty() {
-        // "".split('\n') yields one empty element, not zero - eliding an
-        // empty middle (keep_head+keep_tail covering the whole input) would
-        // otherwise store "" and reintroduce a line that was never there,
-        // as well as being a marker that elides nothing.
         let id = store.put(middle.join("\n").as_bytes())?;
         out.push(elide_marker(middle.len(), &id));
     }
     out.extend(dedup_lines(tail, opts.dedup_min_repeat));
-    Ok(out.join("\n").into_bytes())
+    Ok(dedup_scattered(out).join("\n").into_bytes())
 }
 
 /// Reconstruct the original exactly, given the same `store` the content was
@@ -103,9 +99,13 @@ pub fn decompress_text(store: &Store, input: &[u8]) -> std::io::Result<Vec<u8>> 
     let text = std::str::from_utf8(input)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     let mut out: Vec<String> = Vec::new();
+    let mut dedup_map: HashMap<usize, String> = HashMap::new();
 
-    for line in text.split('\n') {
-        if let Some((_count, id)) = parse_elide(line) {
+    for (line_idx, line) in text.split('\n').enumerate() {
+        if let Some(ref_idx) = parse_dedup(line) {
+            let content = dedup_map.get(&ref_idx).cloned().unwrap_or_default();
+            out.push(content);
+        } else if let Some((_count, id)) = parse_elide(line) {
             let restored = store.get(&id)?;
             let restored = String::from_utf8(restored)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -116,6 +116,7 @@ pub fn decompress_text(store: &Store, input: &[u8]) -> std::io::Result<Vec<u8>> 
                 out.push(last.clone());
             }
         } else {
+            dedup_map.insert(line_idx, line.to_string());
             out.push(line.to_string());
         }
     }
@@ -246,6 +247,45 @@ fn parse_elide(line: &str) -> Option<(usize, String)> {
     let body = strip_pua(line, "BOOMERANG:ELIDE:")?;
     let (count, id) = body.split_once(':')?;
     Some((count.parse().ok()?, id.to_string()))
+}
+
+fn dedup_marker(line_idx: usize) -> String {
+    format!("{PUA}BOOMERANG:DEDUP:@{line_idx}{PUA}")
+}
+
+fn parse_dedup(line: &str) -> Option<usize> {
+    strip_pua(line, "BOOMERANG:DEDUP:@")?.parse().ok()
+}
+
+fn dedup_scattered(lines: Vec<String>) -> Vec<String> {
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    let mut out = Vec::with_capacity(lines.len());
+    let mut any_deduped = false;
+
+    for (idx, line) in lines.iter().enumerate() {
+        if line.starts_with(PUA) {
+            out.push(line.clone());
+            continue;
+        }
+        if let Some(&first_idx) = seen.get(line) {
+            let marker = dedup_marker(first_idx);
+            if marker.len() < line.len() {
+                out.push(marker);
+                any_deduped = true;
+            } else {
+                out.push(line.clone());
+            }
+        } else {
+            seen.insert(line.clone(), idx);
+            out.push(line.clone());
+        }
+    }
+
+    if any_deduped {
+        out
+    } else {
+        lines
+    }
 }
 
 fn parse_raw_marker(input: &[u8]) -> Option<String> {
@@ -529,6 +569,67 @@ mod tests {
         assert_eq!(result.checked_refs, 0);
     }
 
+    #[test]
+    fn scattered_duplicate_lines_are_collapsed() {
+        let store = temp_store();
+        let long_line = "ERROR: connection refused by upstream host db-replica-03.internal, retrying after exponential backoff";
+        let input = format!(
+            "{long_line}\nsome normal log line here\nanother line\n{long_line}\nfinal line\n{long_line}"
+        );
+        let compressed = assert_round_trips(&store, input.as_bytes(), &TextOptions::default());
+        let compressed_text = String::from_utf8(compressed.clone()).unwrap();
+        let occurrences = compressed_text.matches(long_line).count();
+        assert_eq!(
+            occurrences, 1,
+            "long duplicate line should appear only once in compressed output, rest replaced by DEDUP markers"
+        );
+        assert!(
+            compressed.len() < input.len(),
+            "scattered dedup should shrink: {} vs {}",
+            compressed.len(),
+            input.len()
+        );
+    }
+
+    #[test]
+    fn scattered_dedup_not_applied_when_marker_would_be_longer() {
+        let store = temp_store();
+        let short = "ok";
+        let input = format!("{short}\nfiller line\n{short}");
+        let compressed = assert_round_trips(&store, input.as_bytes(), &TextOptions::default());
+        assert_eq!(
+            compressed,
+            input.as_bytes(),
+            "short lines should not be replaced — marker is longer than the line itself"
+        );
+    }
+
+    #[test]
+    fn scattered_dedup_across_head_and_tail_with_elision() {
+        let store = temp_store();
+        let long_line =
+            "2024-01-15T10:00:00Z ERROR: timeout waiting for response from authentication service";
+        let mut lines = vec![long_line.to_string()];
+        for i in 0..100 {
+            lines.push(format!("log line {i} padding"));
+        }
+        lines.push(long_line.to_string());
+        let input = lines.join("\n");
+        let opts = TextOptions {
+            dedup_min_repeat: 3,
+            elide_threshold_lines: 20,
+            keep_head: 5,
+            keep_tail: 5,
+        };
+        let compressed = assert_round_trips(&store, input.as_bytes(), &opts);
+        let compressed_text = String::from_utf8(compressed).unwrap();
+        let occurrences = compressed_text.matches(long_line).count();
+        assert_eq!(
+            occurrences, 1,
+            "duplicate across head/tail boundary should be deduped"
+        );
+    }
+
     mod proptests {
         use super::*;
         use proptest::prelude::*;
@@ -543,6 +644,7 @@ mod tests {
                 1 => Just(format!("{PUA}BOOMERANG:ELIDE:5:deadbeefdeadbeefdeadbeefdeadbeefdeadbeef{PUA}")),
                 1 => Just(format!("{PUA}BOOMERANG:REPEAT:3{PUA}")),
                 1 => Just(format!("{PUA}BOOMERANG:RAW:deadbeefdeadbeefdeadbeefdeadbeefdeadbeef{PUA}")),
+                1 => Just(format!("{PUA}BOOMERANG:DEDUP:@42{PUA}")),
                 1 => "[a-zA-Z]{0,8}".prop_map(|s| format!("{PUA}{s}")),
                 1 => "[a-zA-Z]{0,8}".prop_map(|s| format!("{PUA}\u{E001}{s}")),
             ]
