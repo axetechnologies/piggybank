@@ -234,6 +234,17 @@ impl Session {
     /// than silently compared — a non-hex string can never match a real
     /// store id, so "not changed" would be a lie and "changed" would be
     /// misleading; better to tell the caller their input is wrong.
+    /// Return the byte size of content currently accumulated under `key`,
+    /// or 0 if the key has never been seen. Used by the MCP server to
+    /// track how many bytes `compress_append` avoided resending.
+    pub fn accumulated_size(&self, key: &str) -> usize {
+        self.last_seen
+            .borrow()
+            .get(key)
+            .and_then(|id| self.store.get(id).ok())
+            .map_or(0, |bytes| bytes.len())
+    }
+
     pub fn check_changed(&self, key: &str, hash: &str) -> Result<(bool, bool), &'static str> {
         if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err("invalid hash: expected 64 lowercase hex characters (sha256)");

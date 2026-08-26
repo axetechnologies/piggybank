@@ -52,12 +52,18 @@ fn decode_view(view: &str) -> Result<(&str, &str), String> {
     Ok((parts[2], body))
 }
 
+const BYTES_PER_TOKEN: f64 = 4.0;
+const DEFAULT_RATE_PER_MTOK: f64 = 3.0;
+
 struct ServerState {
     store: Store,
     session: Session,
     total_original: AtomicU64,
     total_compressed: AtomicU64,
     compress_calls: AtomicU64,
+    skipped_resends: AtomicU64,
+    append_bytes_avoided: AtomicU64,
+    budget_enforcements: AtomicU64,
 }
 
 pub fn serve(store_dir: &str) -> io::Result<()> {
@@ -67,6 +73,9 @@ pub fn serve(store_dir: &str) -> io::Result<()> {
         total_original: AtomicU64::new(0),
         total_compressed: AtomicU64::new(0),
         compress_calls: AtomicU64::new(0),
+        skipped_resends: AtomicU64::new(0),
+        append_bytes_avoided: AtomicU64::new(0),
+        budget_enforcements: AtomicU64::new(0),
     };
 
     let stdin = io::stdin();
@@ -426,6 +435,10 @@ fn handle_compress_budget(state: &ServerState, args: &Value) -> Result<Value, St
         boomerang_core::compress_text_budget(&state.store, content.as_bytes(), max_bytes)
             .map_err(|e| e.to_string())?;
     let within_budget = compressed.len() <= max_bytes;
+    let normal_would_exceed = content.len() > max_bytes;
+    if normal_would_exceed && within_budget {
+        state.budget_enforcements.fetch_add(1, Relaxed);
+    }
     let savings = record_and_savings(state, content.len(), compressed.len());
     Ok(json!({
         "view": encode_view("text", &compressed),
@@ -446,10 +459,14 @@ fn handle_compress_append(state: &ServerState, args: &Value) -> Result<Value, St
         .and_then(Value::as_str)
         .ok_or("missing 'content' argument")?;
     let new_bytes = content.as_bytes();
+    let accumulated_size = state.session.accumulated_size(key);
     let view_bytes = state
         .session
         .append(key, new_bytes)
         .map_err(|e| e.to_string())?;
+    if accumulated_size > 0 {
+        state.append_bytes_avoided.fetch_add(accumulated_size as u64, Relaxed);
+    }
     let savings = record_and_savings(state, new_bytes.len(), view_bytes.len());
     Ok(json!({
         "view": encode_view("text", &view_bytes),
@@ -463,6 +480,9 @@ fn handle_changed(state: &ServerState, args: &Value) -> Result<Value, String> {
     let key = args.get("key").and_then(Value::as_str).ok_or("missing 'key' argument")?;
     let hash = args.get("hash").and_then(Value::as_str).ok_or("missing 'hash' argument")?;
     let (changed, known) = state.session.check_changed(key, hash).map_err(|e| e.to_string())?;
+    if known && !changed {
+        state.skipped_resends.fetch_add(1, Relaxed);
+    }
     Ok(json!({ "changed": changed, "known": known }))
 }
 
@@ -472,6 +492,10 @@ fn handle_stats(state: &ServerState) -> Result<Value, String> {
     let tot_comp = state.total_compressed.load(Relaxed);
     let saved = tot_orig.saturating_sub(tot_comp);
     let pct = if tot_orig > 0 { (saved as f64 / tot_orig as f64) * 100.0 } else { 0.0 };
+    let append_avoided = state.append_bytes_avoided.load(Relaxed);
+    let total_bytes_saved = saved + append_avoided;
+    let tokens_saved = total_bytes_saved as f64 / BYTES_PER_TOKEN;
+    let cost_saved = tokens_saved * DEFAULT_RATE_PER_MTOK / 1_000_000.0;
     Ok(json!({
         "store_entries": stats.entries,
         "store_bytes": stats.bytes,
@@ -480,5 +504,15 @@ fn handle_stats(state: &ServerState) -> Result<Value, String> {
         "lifetime_compressed_bytes": tot_comp,
         "lifetime_saved_bytes": saved,
         "lifetime_saved_pct": format!("{pct:.1}%"),
+        "token_savings": {
+            "estimated_input_tokens_saved": tokens_saved as u64,
+            "skipped_resends": state.skipped_resends.load(Relaxed),
+            "append_bytes_avoided": append_avoided,
+            "budget_enforcements": state.budget_enforcements.load(Relaxed),
+        },
+        "cost_estimate": {
+            "rate_per_mtok_usd": DEFAULT_RATE_PER_MTOK,
+            "estimated_usd_saved": format!("{cost_saved:.6}"),
+        },
     }))
 }
