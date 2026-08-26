@@ -1,7 +1,7 @@
 use crate::markers::{escape_lines, strip_pua, unescape_lines, PUA};
 use crate::Store;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Error, ErrorKind};
 use std::path::{Path, PathBuf};
@@ -173,7 +173,12 @@ impl Session {
         self.persist()?;
 
         match previous_id {
-            None => Ok(escape_for_view(content)),
+            None => {
+                if let Some(cref) = self.try_cross_key_diff(content, key)? {
+                    return Ok(cref);
+                }
+                Ok(escape_for_view(content))
+            }
             Some(prev_id) if prev_id == new_id => Ok(unchanged_marker(&prev_id).into_bytes()),
             Some(prev_id) => {
                 let old_text = utf8(self.store.get(&prev_id)?)?;
@@ -222,10 +227,10 @@ impl Session {
         }
 
         if let Some((first, rest)) = text.split_once('\n') {
-            if let Some(prev_id) = strip_pua(first, "BOOMERANG:DIFF:") {
+            if let Some(prev_id) = strip_pua(first, "BOOMERANG:DIFF:")
+                .or_else(|| strip_pua(first, "BOOMERANG:CREF:"))
+            {
                 let old_text = utf8(self.store.get(prev_id)?)?;
-                // Must match exactly what compress()'s diff branch built
-                // old_lines from, or the diff ops won't line up.
                 let old_escaped = escape_lines(&old_text);
                 let old_lines: Vec<&str> = old_escaped.split('\n').collect();
                 let ops = parse_diff(rest)
@@ -251,8 +256,10 @@ impl Session {
         if let Some(id) = strip_pua(text, "BOOMERANG:UNCHANGED:") {
             result.check(&self.store, id)?;
         } else if let Some((first, _rest)) = text.split_once('\n') {
-            if let Some(prev_id) = strip_pua(first, "BOOMERANG:DIFF:") {
-                result.check(&self.store, prev_id)?;
+            if let Some(ref_id) = strip_pua(first, "BOOMERANG:DIFF:")
+                .or_else(|| strip_pua(first, "BOOMERANG:CREF:"))
+            {
+                result.check(&self.store, ref_id)?;
             }
         }
         Ok(result.finish())
@@ -319,6 +326,54 @@ impl Session {
             .map_or(0, |bytes| bytes.len())
     }
 
+    fn try_cross_key_diff(&self, content: &[u8], current_key: &str) -> io::Result<Option<Vec<u8>>> {
+        let new_text = match std::str::from_utf8(content) {
+            Ok(t) => t,
+            Err(_) => return Ok(None),
+        };
+        let new_escaped = escape_lines(new_text);
+        let new_lines: Vec<&str> = new_escaped.split('\n').collect();
+        if new_lines.len() < 5 {
+            return Ok(None);
+        }
+
+        let last_seen = self.last_seen.borrow();
+        for (key, content_id) in last_seen.iter() {
+            if key == current_key {
+                continue;
+            }
+            let Ok(old_content) = self.store.get(content_id) else {
+                continue;
+            };
+            let Ok(old_text) = std::str::from_utf8(&old_content) else {
+                continue;
+            };
+            let old_escaped = escape_lines(old_text);
+            let old_lines: Vec<&str> = old_escaped.split('\n').collect();
+
+            let cell_count = (old_lines.len() as u64 + 1) * (new_lines.len() as u64 + 1);
+            if cell_count > MAX_DIFF_CELLS {
+                continue;
+            }
+
+            let old_set: HashSet<&str> = old_lines.iter().copied().collect();
+            let overlap = new_lines.iter().filter(|l| old_set.contains(*l)).count();
+            if overlap * 3 < new_lines.len() {
+                continue;
+            }
+
+            let ops = lcs_diff(&old_lines, &new_lines);
+            let mut out = cref_marker(content_id);
+            out.push('\n');
+            out.push_str(&format_diff(&ops));
+            let out_bytes = out.into_bytes();
+            if out_bytes.len() < content.len() {
+                return Ok(Some(out_bytes));
+            }
+        }
+        Ok(None)
+    }
+
     pub fn check_changed(&self, key: &str, hash: &str) -> Result<(bool, bool), &'static str> {
         if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err("invalid hash: expected 64 lowercase hex characters (sha256)");
@@ -351,6 +406,10 @@ fn unchanged_marker(id: &str) -> String {
 
 fn diff_marker(id: &str) -> String {
     format!("{PUA}BOOMERANG:DIFF:{id}{PUA}")
+}
+
+fn cref_marker(id: &str) -> String {
+    format!("{PUA}BOOMERANG:CREF:{id}{PUA}")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -599,6 +658,52 @@ mod tests {
         // b.rs has never been seen -> passthrough, not a diff against a.rs.
         let compressed = session.compress("b.rs", b"content b").unwrap();
         assert_eq!(compressed, b"content b");
+    }
+
+    #[test]
+    fn cross_key_diff_compresses_similar_first_sight_content() {
+        let session = Session::new(temp_store());
+        let base: Vec<String> = (0..30).map(|i| format!("config_line_{i} = value")).collect();
+        let base_text = base.join("\n");
+        session.compress("config-a.yaml", base_text.as_bytes()).unwrap();
+
+        let mut variant = base.clone();
+        variant[5] = "config_line_5 = CHANGED".to_string();
+        variant[15] = "config_line_15 = ALSO_CHANGED".to_string();
+        let variant_text = variant.join("\n");
+
+        let compressed = session.compress("config-b.yaml", variant_text.as_bytes()).unwrap();
+        let compressed_str = String::from_utf8(compressed.clone()).unwrap();
+        assert!(
+            compressed_str.contains("BOOMERANG:CREF:"),
+            "similar content under a new key should produce a CREF diff"
+        );
+        assert!(
+            compressed.len() < variant_text.len(),
+            "CREF diff should be smaller than raw content: {} vs {}",
+            compressed.len(),
+            variant_text.len()
+        );
+
+        let restored = session.decompress(&compressed).unwrap();
+        assert_eq!(restored, variant_text.as_bytes());
+
+        let result = session.verify(&compressed).unwrap();
+        assert!(result.ok);
+        assert_eq!(result.checked_refs, 1);
+    }
+
+    #[test]
+    fn cross_key_diff_skipped_when_low_overlap() {
+        let session = Session::new(temp_store());
+        session.compress("a.txt", b"alpha\nbeta\ngamma\ndelta\nepsilon").unwrap();
+        let unrelated = b"one\ntwo\nthree\nfour\nfive\nsix\nseven";
+        let compressed = session.compress("b.txt", unrelated).unwrap();
+        let compressed_str = String::from_utf8(compressed.clone()).unwrap();
+        assert!(
+            !compressed_str.contains("BOOMERANG:CREF:"),
+            "unrelated content should not produce a CREF diff"
+        );
     }
 
     #[test]
@@ -860,6 +965,7 @@ mod tests {
                 4 => "[a-zA-Z0-9 ]{0,15}",
                 1 => Just(format!("{PUA}BOOMERANG:UNCHANGED:deadbeefdeadbeefdeadbeefdeadbeefdeadbeef{PUA}")),
                 1 => Just(format!("{PUA}BOOMERANG:DIFF:deadbeefdeadbeefdeadbeefdeadbeefdeadbeef{PUA}")),
+                1 => Just(format!("{PUA}BOOMERANG:CREF:deadbeefdeadbeefdeadbeefdeadbeefdeadbeef{PUA}")),
                 1 => Just(format!("{PUA}BOOMERANG:SAME:3{PUA}")),
             ]
         }
