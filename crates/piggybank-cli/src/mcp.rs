@@ -31,6 +31,9 @@ use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
+const BRAIN_URL: &str = "https://brain.axe.onl/api/save";
+const REPORT_EVERY_N_CALLS: u64 = 10;
+
 const VIEW_VERSION: u8 = 1;
 
 fn encode_view(kind: &str, compressed: &[u8]) -> String {
@@ -65,6 +68,8 @@ struct ServerState {
     append_bytes_avoided: AtomicU64,
     budget_enforcements: AtomicU64,
     analytics_path: std::path::PathBuf,
+    hostname: String,
+    last_reported_calls: AtomicU64,
 }
 
 impl ServerState {
@@ -84,7 +89,95 @@ impl ServerState {
         if std::fs::write(&tmp, data.to_string().as_bytes()).is_ok() {
             let _ = std::fs::rename(&tmp, &self.analytics_path);
         }
+
+        let calls = self.compress_calls.load(Relaxed);
+        let last = self.last_reported_calls.load(Relaxed);
+        if calls >= last + REPORT_EVERY_N_CALLS {
+            self.last_reported_calls.store(calls, Relaxed);
+            self.report_to_brain();
+        }
     }
+
+    fn report_to_brain(&self) {
+        let brain_key = std::env::var("BRAIN_KEY")
+            .or_else(|_| std::env::var("AXE_FLEET_KEY"))
+            .unwrap_or_default();
+        if brain_key.is_empty() {
+            return;
+        }
+
+        let tot_orig = self.total_original.load(Relaxed);
+        let tot_comp = self.total_compressed.load(Relaxed);
+        let saved = tot_orig.saturating_sub(tot_comp);
+        let append_avoided = self.append_bytes_avoided.load(Relaxed);
+        let total_bytes_saved = saved + append_avoided;
+        let tokens_saved = total_bytes_saved as f64 / BYTES_PER_TOKEN;
+        let cost_saved = tokens_saved * DEFAULT_RATE_PER_MTOK / 1_000_000.0;
+        let calls = self.compress_calls.load(Relaxed);
+        let pct = if tot_orig > 0 {
+            (saved as f64 / tot_orig as f64) * 100.0
+        } else {
+            0.0
+        };
+
+        let content = format!(
+            "compress_calls: {calls} | original: {tot_orig}B | compressed: {tot_comp}B | \
+             saved: {saved}B ({pct:.1}%) | append_avoided: {append_avoided}B | \
+             tokens_saved: {tokens_saved:.0} | cost_saved: ${cost_saved:.4} | \
+             skipped_resends: {} | budget_enforcements: {}",
+            self.skipped_resends.load(Relaxed),
+            self.budget_enforcements.load(Relaxed),
+        );
+
+        let payload = json!({
+            "title": format!("piggybank stats — {}", self.hostname),
+            "content": content,
+            "tags": "piggybank,stats,fleet,telemetry",
+            "agent": format!("piggybank@{}", self.hostname),
+            "key": format!("piggybank:stats:{}", self.hostname),
+            "value": json!({
+                "hostname": self.hostname,
+                "compress_calls": calls,
+                "total_original_bytes": tot_orig,
+                "total_compressed_bytes": tot_comp,
+                "total_saved_bytes": saved,
+                "saved_pct": format!("{pct:.1}"),
+                "append_bytes_avoided": append_avoided,
+                "tokens_saved": tokens_saved as u64,
+                "cost_saved_usd": format!("{cost_saved:.6}"),
+                "skipped_resends": self.skipped_resends.load(Relaxed),
+                "budget_enforcements": self.budget_enforcements.load(Relaxed),
+            }).to_string(),
+        });
+
+        let payload_str = payload.to_string();
+        let brain_key_clone = brain_key.clone();
+        std::thread::spawn(move || {
+            let _ = std::process::Command::new("curl")
+                .args([
+                    "-sf",
+                    "-X", "POST",
+                    BRAIN_URL,
+                    "-H", "Content-Type: application/json",
+                    "-H", &format!("X-AXE-Key: {brain_key_clone}"),
+                    "-d", &payload_str,
+                    "--max-time", "5",
+                ])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        });
+    }
+}
+
+fn gethostname() -> String {
+    std::process::Command::new("hostname")
+        .arg("-s")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 fn load_counter(v: &Value, key: &str) -> AtomicU64 {
@@ -115,6 +208,7 @@ pub fn serve(store_dir: &str, gc_days: u64) -> io::Result<()> {
         }
     }
 
+    let hostname = gethostname();
     let state = ServerState {
         session: Session::open(store_dir)?,
         store,
@@ -125,6 +219,8 @@ pub fn serve(store_dir: &str, gc_days: u64) -> io::Result<()> {
         append_bytes_avoided: load_counter(&saved, "append_bytes_avoided"),
         budget_enforcements: load_counter(&saved, "budget_enforcements"),
         analytics_path,
+        hostname,
+        last_reported_calls: AtomicU64::new(0),
     };
 
     let stdin = io::stdin();
@@ -539,6 +635,7 @@ fn handle_changed(state: &ServerState, args: &Value) -> Result<Value, String> {
 }
 
 fn handle_stats(state: &ServerState) -> Result<Value, String> {
+    state.report_to_brain();
     let stats = state.store.stats().map_err(|e| e.to_string())?;
     let tot_orig = state.total_original.load(Relaxed);
     let tot_comp = state.total_compressed.load(Relaxed);
