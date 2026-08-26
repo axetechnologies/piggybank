@@ -187,6 +187,18 @@ fn tool_defs() -> Value {
             }
         },
         {
+            "name": "changed",
+            "description": "Check whether content under a session key has changed without sending the content itself. Pass the sha256 hex hash of your current content (64 lowercase hex characters); Boomerang compares it against the hash stored from the last compress call under that key. Returns {changed, known}: known is false if the key has never been compressed; changed is true only when known and the hashes differ. Use before a full compress call to avoid resending unchanged content — a 64-byte check instead of a multi-KB upload.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "key": { "type": "string", "description": "The key previously used with compress." },
+                    "hash": { "type": "string", "description": "The sha256 hex hash of your current content." }
+                },
+                "required": ["key", "hash"]
+            }
+        },
+        {
             "name": "stats",
             "description": "Report store size and lifetime compression savings: total calls, bytes in, bytes out, bytes saved, and savings percentage since activation.",
             "inputSchema": { "type": "object", "properties": {} }
@@ -204,6 +216,7 @@ fn handle_tools_call(state: &ServerState, id: Value, request: &Value) -> Value {
         "decompress" => handle_decompress(state, &arguments),
         "verify" => handle_verify(state, &arguments),
         "retrieve" => handle_retrieve(state, &arguments),
+        "changed" => handle_changed(state, &arguments),
         "stats" => handle_stats(state),
         other => Err(format!("unknown tool: {other}")),
     };
@@ -370,6 +383,13 @@ fn handle_retrieve(state: &ServerState, args: &Value) -> Result<Value, String> {
     // never fails the retrieve itself.
     let first_seen_unix = state.store.first_seen(reference).ok().flatten();
     Ok(json!({ "content": String::from_utf8_lossy(&bytes), "first_seen_unix": first_seen_unix }))
+}
+
+fn handle_changed(state: &ServerState, args: &Value) -> Result<Value, String> {
+    let key = args.get("key").and_then(Value::as_str).ok_or("missing 'key' argument")?;
+    let hash = args.get("hash").and_then(Value::as_str).ok_or("missing 'hash' argument")?;
+    let (changed, known) = state.session.check_changed(key, hash).map_err(|e| e.to_string())?;
+    Ok(json!({ "changed": changed, "known": known }))
 }
 
 fn handle_stats(state: &ServerState) -> Result<Value, String> {

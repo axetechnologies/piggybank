@@ -183,6 +183,30 @@ impl Session {
         }
         Ok(result.finish())
     }
+
+    /// Check whether the content last compressed under `key` matches a
+    /// caller-supplied sha256 hex hash, without the caller needing to
+    /// resend the content itself. Returns `(changed, known)`:
+    ///
+    /// - `known`: whether `key` has ever been compressed in this session.
+    /// - `changed`: `true` only when `key` is known AND the stored hash
+    ///   differs from `hash`. `false` for unknown keys (nothing to compare
+    ///   against) and for matching hashes.
+    ///
+    /// `hash` must be a 64-character lowercase hex string (the format
+    /// `Store::put` produces). Anything else is rejected as invalid rather
+    /// than silently compared — a non-hex string can never match a real
+    /// store id, so "not changed" would be a lie and "changed" would be
+    /// misleading; better to tell the caller their input is wrong.
+    pub fn check_changed(&self, key: &str, hash: &str) -> Result<(bool, bool), &'static str> {
+        if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err("invalid hash: expected 64 lowercase hex characters (sha256)");
+        }
+        match self.last_seen.borrow().get(key) {
+            None => Ok((false, false)),
+            Some(stored) => Ok((stored != hash, true)),
+        }
+    }
 }
 
 /// Escape `content`'s lines for use as a compressed view, if it's UTF-8
@@ -345,6 +369,7 @@ fn parse_diff(text: &str) -> Option<Vec<DiffOp>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
 
     fn temp_store() -> Store {
         let dir = std::env::temp_dir().join(format!(
@@ -556,6 +581,50 @@ mod tests {
         let result = session.verify(&view).unwrap();
         assert!(result.ok);
         assert_eq!(result.checked_refs, 0);
+    }
+
+    #[test]
+    fn check_changed_unknown_key_reports_not_known() {
+        let session = Session::new(temp_store());
+        let hash = "a".repeat(64);
+        let (changed, known) = session.check_changed("never-seen.txt", &hash).unwrap();
+        assert!(!known);
+        assert!(!changed);
+    }
+
+    #[test]
+    fn check_changed_matching_hash_reports_not_changed() {
+        let session = Session::new(temp_store());
+        let content = b"hello world";
+        session.compress("f.txt", content).unwrap();
+        let hash = hex::encode(sha2::Sha256::digest(content));
+        let (changed, known) = session.check_changed("f.txt", &hash).unwrap();
+        assert!(known);
+        assert!(!changed);
+    }
+
+    #[test]
+    fn check_changed_different_hash_reports_changed() {
+        let session = Session::new(temp_store());
+        session.compress("f.txt", b"version 1").unwrap();
+        let different_hash = hex::encode(sha2::Sha256::digest(b"version 2"));
+        let (changed, known) = session.check_changed("f.txt", &different_hash).unwrap();
+        assert!(known);
+        assert!(changed);
+    }
+
+    #[test]
+    fn check_changed_rejects_invalid_hashes() {
+        let session = Session::new(temp_store());
+        session.compress("f.txt", b"content").unwrap();
+        assert!(session.check_changed("f.txt", "too-short").is_err());
+        assert!(session.check_changed("f.txt", "").is_err());
+        assert!(session
+            .check_changed("f.txt", &"g".repeat(64))
+            .is_err());
+        assert!(session
+            .check_changed("f.txt", &"g".repeat(64))
+            .is_err()); // 'g' is not a hex digit
     }
 
     mod proptests {
