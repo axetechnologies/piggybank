@@ -212,10 +212,18 @@ fn handle_tools_call(state: &ServerState, id: Value, request: &Value) -> Value {
     // JSON-RPC error — the JSON-RPC error object is reserved for protocol
     // problems (unknown method, malformed request), not tool business logic.
     match result {
-        Ok(value) => ok(
-            id,
-            json!({ "content": [{ "type": "text", "text": value.to_string() }] }),
-        ),
+        Ok(value) => {
+            // Plain-string results (e.g. decompress reconstructing raw text) are
+            // returned as-is; structured results are JSON-serialized.
+            let text = match value {
+                Value::String(s) => s,
+                other => other.to_string(),
+            };
+            ok(
+                id,
+                json!({ "content": [{ "type": "text", "text": text }] }),
+            )
+        }
         Err(message) => ok(
             id,
             json!({ "content": [{ "type": "text", "text": message }], "isError": true }),
@@ -300,7 +308,7 @@ fn handle_decompress(state: &ServerState, args: &Value) -> Result<Value, String>
     let (kind, body) = decode_view(view)?;
 
     let restored = dispatch_decompress(state, kind, body)?;
-    Ok(json!({ "content": String::from_utf8_lossy(&restored) }))
+    Ok(Value::String(String::from_utf8_lossy(&restored).into_owned()))
 }
 
 fn handle_verify(state: &ServerState, args: &Value) -> Result<Value, String> {
