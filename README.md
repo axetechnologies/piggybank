@@ -26,7 +26,7 @@ Sub-5ms, 426KB binary. No interpreter, no venv, no model weights, no dependencie
 | `retrieve` | Fetch exact original bytes behind any reference id, plus `first_seen_unix` provenance. |
 | `changed` | Fingerprint check: send a sha256 hash, skip recompression if content hasn't changed. |
 | `compress_append` | Streaming append: send only new bytes for log tailing / build polling. |
-| `compress_budget` | Budget-constrained: "I have N bytes of budget — give me maximum information density." |
+| `compress_budget` | Budget-constrained with anomaly-ranked selection: "I have N bytes of budget — give me maximum information density." Errors, warnings, and failures survive tight budgets. |
 | `stats` | Store metrics, token savings analytics, and cost estimates. |
 
 ### Token savings analytics
@@ -39,11 +39,11 @@ The `stats` tool tracks cumulative savings across the session:
 
 ### Three compression strategies
 
-1. **JSON** — Homogeneous arrays become columnar tables (keys once, then rows). Value interning deduplicates repeated subtrees across the entire document. Cross-call content-addressing means the second fetch of unchanged data costs nearly nothing.
+1. **JSON** — Homogeneous arrays become columnar tables (keys once, then rows). Recursive value interning deduplicates repeated subtrees across the entire document with column dictionary encoding for repeated column values. Cross-call content-addressing means the second fetch of unchanged data costs nearly nothing.
 
-2. **Text/logs** — Consecutive duplicate lines collapsed with counts. Large blocks middle-elided with the elided span held in the store for exact recovery. Anomalous lines (errors, warnings) kept verbatim.
+2. **Text/logs** — Consecutive duplicate lines collapsed with counts. Non-consecutive identical lines deduplicated with lightweight index markers. Large blocks middle-elided with the elided span held in the store for exact recovery. Budget-constrained mode uses anomaly-ranked line selection: errors, warnings, failures, and stack traces score highest and survive tight budgets while normal output is elided.
 
-3. **Session diffing** — First sight passes through; identical re-reads collapse to a short marker; changed re-reads get a compact LCS-based line diff replayable against the stored previous version.
+3. **Session diffing** — First sight passes through; identical re-reads collapse to a short marker; changed re-reads get a compact LCS-based line diff replayable against the stored previous version. Cross-key dedup: when a new key's content shares >33% line overlap with any existing key's stored content, a compact cross-reference diff is emitted instead of full passthrough.
 
 ## Beyond compression
 
@@ -88,6 +88,6 @@ Byte-for-byte, always. Tested as a hard property (proptest fuzzing, 76 tests), n
 
 ## Status
 
-All eight tools built, tested (76 tests including proptests), and exposed over a hand-rolled MCP server (no SDK, no async runtime — just newline-delimited JSON-RPC over stdio). Release binary is size-tuned (`opt-level = "z"`, LTO, single codegen unit, stripped) while keeping `panic=unwind` for per-request resilience in the long-running server.
+All eight tools built, tested (87 tests including proptests), and exposed over a hand-rolled MCP server (no SDK, no async runtime — just newline-delimited JSON-RPC over stdio). Release binary is size-tuned (`opt-level = "z"`, LTO, single codegen unit, stripped) while keeping `panic=unwind` for per-request resilience in the long-running server.
 
 See [`docs/ROADMAP.md`](docs/ROADMAP.md) for planned features.

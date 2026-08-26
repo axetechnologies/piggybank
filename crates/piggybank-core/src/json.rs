@@ -831,10 +831,16 @@ mod tests {
     /// file directly (simulating content going missing out from under a
     /// view) - `Store` deliberately doesn't expose its root path itself.
     fn temp_store_with_dir() -> (crate::Store, std::path::PathBuf) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "piggybank-json-store-test-{:?}-{}",
-            std::time::SystemTime::now(),
-            std::process::id()
+            "piggybank-json-store-test-{}-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
         ));
         (crate::Store::open(&dir).unwrap(), dir)
     }

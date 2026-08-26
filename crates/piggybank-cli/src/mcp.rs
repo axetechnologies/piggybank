@@ -200,7 +200,7 @@ fn tool_defs() -> Value {
     json!([
         {
             "name": "compress",
-            "description": "Compress content before it reaches an LLM. Auto-detects JSON (lossless columnar compression: repeated keys/values in arrays-of-objects amortized) vs text/logs (consecutive-line dedup + middle elision for large blocks, exact recovery via retrieve). Pass `key` (e.g. a file path) to diff against whatever was last compressed under that same key in this session, instead of resending it in full.",
+            "description": "Compress content before it reaches an LLM. Auto-detects JSON (lossless columnar compression with recursive value interning: repeated keys/values/subtrees in arrays-of-objects amortized, cross-call content-addressing deduplicates across separate calls) vs text/logs (consecutive and non-consecutive line dedup + middle elision for large blocks, exact recovery via retrieve). Pass `key` (e.g. a file path) to diff against whatever was last compressed under that same key in this session. First-sight keys with no prior version are automatically diffed against other keys' stored content when >33% line overlap is detected (cross-key dedup).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -257,7 +257,7 @@ fn tool_defs() -> Value {
         },
         {
             "name": "compress_budget",
-            "description": "Budget-constrained compression: 'I have N bytes of context budget — give me the highest information density you can fit.' Compresses content with a hard byte ceiling. If normal compression already fits, returns that. Otherwise progressively elides more of the middle (stored for recovery via retrieve) until the view fits. Elided content is never lost — retrieve any reference id to get the exact original bytes back. Use when context window space is scarce and you need the most important parts of large output.",
+            "description": "Budget-constrained compression: 'I have N bytes of context budget — give me the highest information density you can fit.' Compresses content with a hard byte ceiling. If normal compression already fits, returns that. Otherwise uses anomaly-ranked selection: lines are scored by importance (errors, warnings, failures, stack traces score highest) and the most informative lines are kept while gaps are replaced with ELIDE markers (stored for recovery via retrieve). Elided content is never lost — retrieve any reference id to get the exact original bytes back. Use when context window space is scarce and you need the most important parts of large output.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
