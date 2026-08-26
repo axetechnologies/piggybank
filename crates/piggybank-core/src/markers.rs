@@ -1,4 +1,4 @@
-/// Private-use-area sentinel used to delimit Boomerang's own control lines
+/// Private-use-area sentinel used to delimit Piggybank's own control lines
 /// inside compressed text. Chosen because it essentially never appears in
 /// real logs/text/code, so control lines usually can't collide with content.
 /// "Usually" is not good enough on its own — see `escape_lines` below, which

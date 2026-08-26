@@ -1,195 +1,93 @@
-# Boomerang
+# Piggybank
 
-Micro context-compression for AI agents. A much lighter, more robust take on
-[headroom](https://github.com/chopratejas/headroom): same core idea (shrink
-what an agent reads before it hits the LLM, never actually lose anything),
-built as a single self-contained Rust binary instead of a Python package that
-pulls in `torch`+`transformers`. Measured, not asserted: 426KB release binary
-(size-tuned release profile: LTO, single codegen unit, stripped), sub-5ms
-cold start, only linked against the OS's own `libSystem` on macOS —
-on Linux with a musl target it's genuinely fully static. "Static" isn't quite
-the right word on macOS specifically (Apple doesn't support fully static
-linking there at all — even `libSystem` is always dynamic), so what actually
-matters and is true everywhere: no interpreter, no package manager, no venv,
-nothing that can rot out from under it the way `headroom-ai`'s did.
+**Formerly Boomerang.** Context-compression for AI agents — every token saved is money back in the piggybank.
 
-## Why this exists
+A lightweight, self-contained Rust binary that sits between an agent and its LLM, compressing what the agent reads before it hits the context window. Nothing is ever lost: every compressed reference resolves back to the exact original bytes, byte-for-byte, always.
 
-`headroom-ai`'s pipx venv broke because Homebrew retired the Python version
-it was pinned to — a rotted interpreter symlink took down an MCP server with
-one line in a config file. That's not a headroom-specific bug, it's what
-happens when a context-compression layer — something that sits between an
-agent and its own perception of the world — depends on a large, versioned
-runtime. Boomerang's answer: no interpreter, no downloaded model weights, no
-venv. One binary.
+## Why "Piggybank"?
 
-## The name
+Every token an agent sends to an LLM costs money. Piggybank saves those tokens — and tracks exactly how many it saved, what that cost in dollars, and how the savings compound over time. The name is the value proposition: this is where your token budget goes to grow.
 
-Headroom compresses; Boomerang returns. The mechanism this project is built
-around is content-addressed, reversible retrieval — nothing is ever deleted,
-only set aside, and it comes back the moment something asks for it by
-reference. A boomerang doesn't need to be fetched — it's already coming back.
+The project was originally called Boomerang ("compress and it comes back"). The rename reflects what matters: not the mechanism (reversible compression), but the outcome (measurable cost savings on every API call).
+
+> Wire-format markers (`BOOMERANG:ELIDE`, `__boomerang_table__`, etc.) are intentionally preserved for backward compatibility with existing compressed content.
+
+## What it does
+
+Sub-5ms, 426KB binary. No interpreter, no venv, no model weights, no dependencies that can rot. One binary, linked only against `libSystem` on macOS (fully static with musl on Linux).
+
+### Eight MCP tools
+
+| Tool | Purpose |
+|------|---------|
+| `compress` | Auto-detect JSON (lossless columnar) or text (dedup + elision). Pass `key` for session-aware diffing. |
+| `decompress` | Full reconstruction from a compressed view. |
+| `verify` | Confirm all references in a compressed view still resolve (stat, not read). |
+| `retrieve` | Fetch exact original bytes behind any reference id, plus `first_seen_unix` provenance. |
+| `changed` | Fingerprint check: send a sha256 hash, skip recompression if content hasn't changed. |
+| `compress_append` | Streaming append: send only new bytes for log tailing / build polling. |
+| `compress_budget` | Budget-constrained: "I have N bytes of budget — give me maximum information density." |
+| `stats` | Store metrics, token savings analytics, and cost estimates. |
+
+### Token savings analytics
+
+The `stats` tool tracks cumulative savings across the session:
+
+- **Tokens saved** from compression, skipped resends, and append-mode deltas
+- **Cost estimates** at configurable $/MTok rates (default $3/MTok)
+- **Efficiency metrics**: compression ratio, budget enforcement count, skip rate
+
+### Three compression strategies
+
+1. **JSON** — Homogeneous arrays become columnar tables (keys once, then rows). Value interning deduplicates repeated subtrees across the entire document. Cross-call content-addressing means the second fetch of unchanged data costs nearly nothing.
+
+2. **Text/logs** — Consecutive duplicate lines collapsed with counts. Large blocks middle-elided with the elided span held in the store for exact recovery. Anomalous lines (errors, warnings) kept verbatim.
+
+3. **Session diffing** — First sight passes through; identical re-reads collapse to a short marker; changed re-reads get a compact LCS-based line diff replayable against the stored previous version.
 
 ## Beyond compression
 
-Strip away the "compressor" framing and what's actually been built is a
-content-addressed, atomically-written, crash-safe, *provably* reversible
-blob store — compress/decompress round-trips are tested exhaustively
-(proptest fuzzing, verified against the real binary, not just asserted),
-not approximated the way headroom's ML-based CCR caching is. That primitive
-is worth more than the compression it happens to enable. Four consequences
-of it, proven not just designed:
+The compression is built on a content-addressed, atomically-written, crash-safe blob store. Four properties that follow from this:
 
-- **Shared memory across agents that never coordinate.** `Store` is just
-  content-addressed files in a directory with atomic writes — nothing
-  requires one caller to know another exists. Two completely independent
-  `boomerang mcp serve` processes pointed at the same store directory, with
-  zero communication between them, compound each other's compression
-  history automatically: the second agent's very first call already
-  benefits from content the first agent introduced. headroom has no
-  equivalent — its compression state doesn't cross process boundaries.
-  Verified with two genuinely separate subprocesses, not two calls in one
-  process (`two_independent_callers_sharing_a_store_benefit_from_each_others_history`
-  in `crates/boomerang-core/src/json.rs`).
-- **Provenance.** Every piece of content ever written to the store records
-  when it was first seen (`.provenance.jsonl`, best-effort, never blocks
-  the write it's attached to), retrievable via the `retrieve` tool's
-  `first_seen_unix` field — regardless of which caller originally wrote it.
-  "What did any agent see, and when" becomes an answerable question instead
-  of something lost the moment content gets compressed away.
-- **Integrity verification without full reconstruction.** The `verify` tool
-  walks a compressed view's reference chain and confirms every id still
-  resolves in the store — `Store::exists` (a stat), not `Store::get` (a
-  read) — reporting exactly which references are missing rather than
-  failing outright. Cheaper than a full `decompress` when a caller only
-  needs "is this still fully reconstructable right now," not the content
-  itself: a lightweight audit/integrity primitive, not just a compression
-  optimization.
-- **Retention, honestly scoped.** "Nothing is ever discarded" is the
-  compression invariant, not a promise that a shared store grows forever
-  for free. `Store::gc(older_than_unix, dry_run)` / `boomerang gc
-  <store-dir> --older-than-days N [--dry-run]` deletes content by age -
-  the only policy a content-addressed store can apply *safely* without a
-  full reachability graph of every compressed view sitting in some agent's
-  conversation history far outside this store's view. Content with no
-  recorded first-seen time is never touched (no basis to judge it
-  eligible), and this is deliberately CLI-only, human-invoked, dry-run
-  capable, and never exposed over MCP - an agent should not be able to
-  delete shared, possibly-multi-tenant content on its own initiative.
+- **Shared memory across agents that never coordinate.** Two independent `piggybank mcp serve` processes sharing a `--store-dir` compound each other's compression history automatically. No communication required.
+- **Provenance.** Every write records `first_seen_unix` — "what did any agent see, and when" is always answerable.
+- **Integrity verification without reconstruction.** `verify` walks reference chains with `stat` calls, not reads — cheaper than full `decompress` when you only need "is this still reconstructable?"
+- **Retention, honestly scoped.** `piggybank gc <store-dir> --older-than-days N [--dry-run]` — age-based, CLI-only, never exposed over MCP. An agent cannot delete shared content on its own initiative.
 
-## Design
+## Setup
 
-Two primitives, nothing else load-bearing:
-
-1. **A view** — a smaller representation of a document.
-2. **Recovery** — the original, byte-for-byte, on demand, forever.
-
-Everything else (proxy, MCP server, per-agent wrappers) is product surface
-around those two. See [`crates/boomerang-core`](crates/boomerang-core) for
-the current state:
-
-- `Store` — a content-addressed blob store (`sha256(bytes) -> bytes` on
-  disk). Writing the same content twice is a no-op. This is what makes
-  compression reversible: a compressor never decides what's safe to discard,
-  because nothing it stores here is ever discarded. Every genuinely new
-  write also records a first-seen timestamp (`first_seen()`,
-  best-effort, never blocks the write it's attached to) — see "Beyond
-  compression" below for what that and shared-directory writes make possible.
-- `compress_json` / `decompress_json` — **lossless** structural compression,
-  two composable passes. First, homogeneous arrays of objects (the shape of
-  almost every API response or tool-result list) become a columnar table:
-  keys written once, then rows of values, instead of repeating every key
-  name per element. Second, value interning: any subtree (object, array, or
-  string) that repeats anywhere in the result — e.g. the same GitHub-user
-  object attached to ten different commits — gets replaced, after its first
-  occurrence, with a short reference into a dictionary. Columnarization
-  alone only dedupes key *names* across rows; interning is what catches
-  repeated *values*, which is where most of the size actually lives in real
-  API responses. Neither pass needs `Store` — there's nothing to hold back
-  for later, because no information is lost.
-- `compress_json_with_store` / `decompress_json_with_store` — beyond
-  parity with headroom, not just matching it: cross-*call* structural
-  memory for JSON, the thing `Session` already gives text but JSON never
-  had. An agent polling the same status endpoint, or re-fetching a metadata
-  object that hasn't changed, has each repeat cost next to nothing starting
-  from the *second* time it's seen — content-addressed, so it works across
-  entirely different documents and calls, not just one tracked key. Same
-  "only commit if it actually shrinks" guarantee as everything else here
-  (the marker itself costs 89 bytes; anything smaller than that never gets
-  promoted, checked exactly, not just filtered by a threshold). This is
-  what the MCP server's `compress`/`decompress` tools use for JSON; the
-  plain `compress_json`/`decompress_json` above stay pure and
-  store-free for callers (like the CLI's `compress`/`decompress`) that want
-  a single, stateless, self-contained transform.
-- `compress_text` / `decompress_text` — dedup of consecutive repeated lines
-  (only when the collapse actually pays for itself) plus middle-elision past
-  a line-count threshold, with the elided span held in `Store` and recovered
-  exactly on retrieval.
-- `Session` — diffs against whatever was last compressed under a given key
-  (e.g. a file path): first sight passes through, an identical re-read
-  collapses to a short marker, a changed re-read gets a compact line diff
-  (a hand-rolled LCS differ) replayable against the stored previous version.
-  `Session::open` persists state to disk so it survives process restarts.
-
-`boomerang mcp serve` ([`crates/boomerang-cli/src/mcp.rs`](crates/boomerang-cli/src/mcp.rs))
-exposes all of it over stdio as a hand-rolled MCP server — no SDK, no async
-runtime, just newline-delimited JSON-RPC. Five tools, named as clean verbs
-(the server name already provides the namespace): `compress`, `decompress`,
-`verify`, `retrieve`, `stats`.
-
-## Claude Code setup
-
-Add to your MCP config (`~/.claude/claude_desktop_config.json` or project `.mcp.json`):
+Add to your MCP config (`~/.claude.json` or project `.mcp.json`):
 
 ```json
 {
   "mcpServers": {
-    "boomerang": {
-      "command": "boomerang",
-      "args": ["mcp", "serve"]
+    "piggybank": {
+      "command": "piggybank",
+      "args": ["mcp", "serve", "--store-dir", "/path/to/store"]
     }
   }
 }
 ```
 
-Tools appear as `compress`, `decompress`, `verify`, `retrieve`, `stats`.
-Compress returns an opaque `view` string — pass it directly to decompress
-or verify. No `kind` tracking needed.
+Or let it default to `~/.piggybank/store`.
 
-Not built yet:
-
-- An HTTP proxy binary, sharing the same core crate.
-- Message-history awareness at the proxy/MCP layer (right now `Session`
-  diffs raw content by caller-supplied key; it doesn't yet auto-detect
-  conversation structure the way headroom's router does).
-
-Explicitly *not* planned for v0: output-token compression (touching what the
-model writes, not just what it reads) and any ML-based prose compressor —
-both are correctness/complexity risks that the deterministic core doesn't
-need in order to capture most of the win.
-
-## The one invariant
+## The invariant
 
 ```
 retrieve(store.put(x)) == x
 ```
 
-byte-for-byte, always. Tested as a hard property in
-`crates/boomerang-core/src/lib.rs`, not eyeballed.
+Byte-for-byte, always. Tested as a hard property (proptest fuzzing, 76 tests), not eyeballed.
+
+## Design principles
+
+- **Lossless round-trip is non-negotiable.** `decompress(compress(x)) == x`. Budget-constrained compression is the one exception, and even there the elided content is recoverable via `retrieve`.
+- **Pay-for-itself discipline.** No transform ever grows the output. If compression doesn't save bytes, it's skipped.
+- **Light over clever.** Simple, obviously-correct implementations. Textbook LCS over Myers, linear scans over indexes, proptest over assumptions.
+- **No new dependencies without justification.** Four crate dependencies total (`serde`, `serde_json`, `sha2`, `hex`).
 
 ## Status
 
-All three compressors (`Store`, JSON, text/log, `Session` diff) are built,
-tested (17 unit tests, all round-trip-verified), and exposed over a real MCP
-server (`boomerang mcp serve`), CI-checked on every push
-(fmt/clippy/test/release build). No HTTP proxy yet, no conversation-structure
-awareness at the MCP layer yet.
+All eight tools built, tested (76 tests including proptests), and exposed over a hand-rolled MCP server (no SDK, no async runtime — just newline-delimited JSON-RPC over stdio). Release binary is size-tuned (`opt-level = "z"`, LTO, single codegen unit, stripped) while keeping `panic=unwind` for per-request resilience in the long-running server.
 
-See [`benchmarks/RESULTS.md`](benchmarks/RESULTS.md) for a real (not
-synthetic) comparison against headroom: boomerang wins on all three corpus
-files — 68–98% reduction on a build log and a git diff (5.6–400x faster,
-zero warmup), and 36.6% vs headroom's 9.8% on a GitHub API JSON response,
-after a real fix (value interning, not a knob turn) closed a genuine gap:
-columnarization alone missed ~9KB of repeated author/committer objects in a
-20.5KB file. See that file for the full analysis, what the fix cost
-(latency on large JSON, measured not assumed), and its limitations.
+See [`docs/ROADMAP.md`](docs/ROADMAP.md) for planned features.

@@ -262,7 +262,7 @@ mod tests {
     }
 
     fn temp_store_with_dir() -> (Store, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!("boomerang-text-test-{}", uuid_ish()));
+        let dir = std::env::temp_dir().join(format!("piggybank-text-test-{}", uuid_ish()));
         (Store::open(&dir).unwrap(), dir)
     }
 

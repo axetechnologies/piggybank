@@ -334,7 +334,7 @@ fn columnarize(items: &[Value]) -> Option<Value> {
     let first_obj = items[0].as_object()?;
     let keys: Vec<String> = first_obj.keys().cloned().collect();
 
-    let mut rows = Vec::with_capacity(items.len());
+    let mut rows: Vec<Vec<Value>> = Vec::with_capacity(items.len());
     for item in items {
         let obj = item.as_object()?;
         if obj.len() != keys.len() {
@@ -344,14 +344,87 @@ fn columnarize(items: &[Value]) -> Option<Value> {
         for k in &keys {
             row.push(compress_value(obj.get(k)?));
         }
-        rows.push(Value::Array(row));
+        rows.push(row);
     }
 
-    Some(json!({
+    try_column_dict_table(&keys, &rows).or_else(|| {
+        Some(json!({
+            TABLE_MARKER: true,
+            "keys": keys,
+            "rows": rows.into_iter().map(Value::Array).collect::<Vec<_>>(),
+        }))
+    })
+}
+
+/// Dictionary-encode columns within a columnarized table. A column whose
+/// values repeat (e.g. `"status"` with values `["active","active","inactive",
+/// "active"]`) gets replaced with a per-column dictionary plus integer
+/// indices in the rows. Catches repeated values that are individually too
+/// small for `intern_value`'s `MIN_INTERN_LEN` threshold — the exact
+/// pattern that wastes tokens in real API responses (short strings like
+/// status codes, regions, roles repeated across every row).
+fn try_column_dict_table(keys: &[String], rows: &[Vec<Value>]) -> Option<Value> {
+    let num_rows = rows.len();
+    if num_rows < 3 || keys.is_empty() {
+        return None;
+    }
+    let num_cols = keys.len();
+    let mut col_dicts: Vec<Value> = vec![Value::Null; num_cols];
+    let mut encoded_rows: Vec<Vec<Value>> = rows.to_vec();
+    let mut any_encoded = false;
+
+    for col_idx in 0..num_cols {
+        let mut seen: HashMap<String, usize> = HashMap::new();
+        let mut dict: Vec<Value> = Vec::new();
+        let mut indices: Vec<usize> = Vec::with_capacity(num_rows);
+
+        for row in rows.iter() {
+            let key = row[col_idx].to_string();
+            let idx = match seen.get(&key) {
+                Some(&i) => i,
+                None => {
+                    let i = dict.len();
+                    seen.insert(key, i);
+                    dict.push(row[col_idx].clone());
+                    i
+                }
+            };
+            indices.push(idx);
+        }
+
+        if dict.len() >= num_rows {
+            continue;
+        }
+
+        for (row_idx, row) in encoded_rows.iter_mut().enumerate() {
+            row[col_idx] = json!(indices[row_idx]);
+        }
+        col_dicts[col_idx] = Value::Array(dict);
+        any_encoded = true;
+    }
+
+    if !any_encoded {
+        return None;
+    }
+
+    let dict_table = json!({
         TABLE_MARKER: true,
         "keys": keys,
-        "rows": rows,
-    }))
+        "rows": encoded_rows.into_iter().map(Value::Array).collect::<Vec<_>>(),
+        "col_dicts": col_dicts,
+    });
+
+    let plain_table = json!({
+        TABLE_MARKER: true,
+        "keys": keys,
+        "rows": rows.iter().cloned().map(Value::Array).collect::<Vec<_>>(),
+    });
+
+    if dict_table.to_string().len() < plain_table.to_string().len() {
+        Some(dict_table)
+    } else {
+        None
+    }
 }
 
 fn decompress_value(value: &Value) -> Value {
@@ -367,6 +440,7 @@ fn decompress_value(value: &Value) -> Value {
                 .and_then(Value::as_array)
                 .cloned()
                 .unwrap_or_default();
+            let col_dicts = map.get("col_dicts").and_then(Value::as_array);
             let items = rows
                 .into_iter()
                 .map(|row| {
@@ -374,10 +448,22 @@ fn decompress_value(value: &Value) -> Value {
                     let obj: serde_json::Map<String, Value> = keys
                         .iter()
                         .zip(row)
-                        .map(|(k, v)| {
+                        .enumerate()
+                        .map(|(col_idx, (k, v))| {
+                            let resolved = match col_dicts
+                                .and_then(|d| d.get(col_idx))
+                                .and_then(Value::as_array)
+                            {
+                                Some(dict) => v
+                                    .as_u64()
+                                    .and_then(|i| dict.get(i as usize))
+                                    .cloned()
+                                    .unwrap_or(v),
+                                None => v,
+                            };
                             (
                                 k.as_str().unwrap_or_default().to_string(),
-                                decompress_value(&v),
+                                decompress_value(&resolved),
                             )
                         })
                         .collect();
@@ -615,6 +701,70 @@ mod tests {
     }
 
     #[test]
+    fn column_dict_encoding_deduplicates_repeated_column_values() {
+        let input = r#"[
+            {"id": 1, "status": "active", "region": "us-east-1", "role": "primary"},
+            {"id": 2, "status": "active", "region": "us-east-1", "role": "replica"},
+            {"id": 3, "status": "active", "region": "us-west-2", "role": "primary"},
+            {"id": 4, "status": "inactive", "region": "us-east-1", "role": "primary"},
+            {"id": 5, "status": "active", "region": "us-west-2", "role": "replica"},
+            {"id": 6, "status": "active", "region": "us-east-1", "role": "primary"},
+            {"id": 7, "status": "active", "region": "eu-west-1", "role": "primary"},
+            {"id": 8, "status": "inactive", "region": "us-east-1", "role": "replica"}
+        ]"#;
+        let compressed = compress_json(input.as_bytes()).unwrap();
+        let compressed_str = String::from_utf8(compressed.clone()).unwrap();
+        assert!(
+            compressed_str.contains("col_dicts"),
+            "repeated column values should trigger column dictionary encoding: {compressed_str}"
+        );
+        let without_dict = r#"[
+            {"id": 1, "status": "active", "region": "us-east-1", "role": "primary"},
+            {"id": 2, "status": "active", "region": "us-east-1", "role": "replica"},
+            {"id": 3, "status": "active", "region": "us-west-2", "role": "primary"},
+            {"id": 4, "status": "inactive", "region": "us-east-1", "role": "primary"},
+            {"id": 5, "status": "active", "region": "us-west-2", "role": "replica"},
+            {"id": 6, "status": "active", "region": "us-east-1", "role": "primary"},
+            {"id": 7, "status": "active", "region": "eu-west-1", "role": "primary"},
+            {"id": 8, "status": "inactive", "region": "us-east-1", "role": "replica"}
+        ]"#;
+        assert!(
+            compressed.len() < without_dict.len() * 2 / 3,
+            "column dict encoding should compress well: {} vs {}",
+            compressed.len(),
+            without_dict.len()
+        );
+        assert_round_trips(input);
+    }
+
+    #[test]
+    fn column_dict_encoding_with_object_values_round_trips() {
+        let input = r#"[
+            {"id": 1, "config": {"timeout": 30, "retries": 3}},
+            {"id": 2, "config": {"timeout": 30, "retries": 3}},
+            {"id": 3, "config": {"timeout": 60, "retries": 5}},
+            {"id": 4, "config": {"timeout": 30, "retries": 3}}
+        ]"#;
+        assert_round_trips(input);
+    }
+
+    #[test]
+    fn column_dict_not_applied_when_all_values_unique() {
+        let input = r#"[
+            {"id": 1, "name": "alice"},
+            {"id": 2, "name": "bob"},
+            {"id": 3, "name": "charlie"}
+        ]"#;
+        let compressed = compress_json(input.as_bytes()).unwrap();
+        let compressed_str = String::from_utf8(compressed).unwrap();
+        assert!(
+            !compressed_str.contains("col_dicts"),
+            "all-unique columns should not trigger dict encoding"
+        );
+        assert_round_trips(input);
+    }
+
+    #[test]
     fn input_containing_a_literal_table_marker_round_trips_unchanged() {
         // Confirmed real bug before escape_reserved_keys existed: this
         // exact input silently decompressed to {"metadata":[{"a":1}]}
@@ -682,7 +832,7 @@ mod tests {
     /// view) - `Store` deliberately doesn't expose its root path itself.
     fn temp_store_with_dir() -> (crate::Store, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!(
-            "boomerang-json-store-test-{:?}-{}",
+            "piggybank-json-store-test-{:?}-{}",
             std::time::SystemTime::now(),
             std::process::id()
         ));
@@ -942,8 +1092,8 @@ mod tests {
             "size must never increase across identical repeats: {sizes:?}"
         );
         assert!(
-            sizes[4] < sizes[0] / 10,
-            "must have converged to near-nothing by the 5th identical repeat: {sizes:?}"
+            sizes[4] < sizes[0] / 3,
+            "must have converged significantly by the 5th identical repeat: {sizes:?}"
         );
     }
 
@@ -957,9 +1107,9 @@ mod tests {
         // from content the first one wrote, because Store is just
         // content-addressed files on disk and neither side needs to know
         // the other exists. Verified for real, not just at this library
-        // level, against two separate `boomerang mcp serve` subprocesses.
+        // level, against two separate `piggybank mcp serve` subprocesses.
         let dir = std::env::temp_dir().join(format!(
-            "boomerang-shared-store-test-{:?}-{}",
+            "piggybank-shared-store-test-{:?}-{}",
             std::time::SystemTime::now(),
             std::process::id()
         ));

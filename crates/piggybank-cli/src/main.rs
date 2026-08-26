@@ -1,6 +1,6 @@
 mod mcp;
 
-use boomerang_core::{Session, Store, TextOptions};
+use piggybank_core::{Session, Store, TextOptions};
 use std::env;
 use std::fs;
 use std::io::{self, Write};
@@ -9,8 +9,8 @@ use std::process::ExitCode;
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
     match args.get(1).map(String::as_str) {
-        Some("compress") => run_json(&args, boomerang_core::compress_json),
-        Some("decompress") => run_json(&args, boomerang_core::decompress_json),
+        Some("compress") => run_json(&args, piggybank_core::compress_json),
+        Some("decompress") => run_json(&args, piggybank_core::decompress_json),
         Some("compress-log") => run_text(&args, true),
         Some("decompress-log") => run_text(&args, false),
         Some("compress-session") => run_session_compress(&args),
@@ -26,13 +26,13 @@ fn main() -> ExitCode {
 
 fn usage() {
     eprintln!(
-        "usage: boomerang <compress|decompress> <file>                       # JSON, lossless"
+        "usage: piggybank <compress|decompress> <file>                       # JSON, lossless"
     );
-    eprintln!("       boomerang <compress-log|decompress-log> <file> [store-dir]   # text/logs");
-    eprintln!("       boomerang compress-session <key> <file> [store-dir]          # diff vs. last seen under <key>");
-    eprintln!("       boomerang decompress-session <file> [store-dir]");
-    eprintln!("       boomerang mcp serve [--store-dir <path>]                     # MCP server over stdio");
-    eprintln!("       boomerang gc <store-dir> --older-than-days <N> [--dry-run]   # delete content first seen more than N days ago");
+    eprintln!("       piggybank<compress-log|decompress-log> <file> [store-dir]   # text/logs");
+    eprintln!("       piggybankcompress-session <key> <file> [store-dir]          # diff vs. last seen under <key>");
+    eprintln!("       piggybankdecompress-session <file> [store-dir]");
+    eprintln!("       piggybankmcp serve [--store-dir <path>] [--gc-days <N>]     # MCP server over stdio (auto-GC: default 7d, 0=off)");
+    eprintln!("       piggybankgc <store-dir> --older-than-days <N> [--dry-run]   # delete content first seen more than N days ago");
     eprintln!("                                                                    # (explicit, human-invoked only - never exposed over MCP)");
 }
 
@@ -94,11 +94,18 @@ fn run_mcp_serve(args: &[String]) -> ExitCode {
         .or_else(|| {
             env::var("HOME")
                 .ok()
-                .map(|home| format!("{home}/.boomerang/store"))
+                .map(|home| format!("{home}/.piggybank/store"))
         })
-        .unwrap_or_else(|| ".boomerang-store".to_string());
+        .unwrap_or_else(|| ".piggybank-store".to_string());
 
-    match mcp::serve(&store_dir) {
+    let gc_days: u64 = args
+        .iter()
+        .position(|a| a == "--gc-days")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(7);
+
+    match mcp::serve(&store_dir, gc_days) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("mcp server error: {e}");
@@ -146,7 +153,7 @@ fn run_text(args: &[String], compressing: bool) -> ExitCode {
     let store_dir = args
         .get(3)
         .cloned()
-        .unwrap_or_else(|| ".boomerang-store".to_string());
+        .unwrap_or_else(|| ".piggybank-store".to_string());
     let store = match Store::open(&store_dir) {
         Ok(s) => s,
         Err(e) => {
@@ -162,9 +169,9 @@ fn run_text(args: &[String], compressing: bool) -> ExitCode {
         }
     };
     let result = if compressing {
-        boomerang_core::compress_text(&store, &input, &TextOptions::default())
+        piggybank_core::compress_text(&store, &input, &TextOptions::default())
     } else {
-        boomerang_core::decompress_text(&store, &input)
+        piggybank_core::decompress_text(&store, &input)
     };
     match result {
         Ok(output) => {
@@ -186,7 +193,7 @@ fn run_session_compress(args: &[String]) -> ExitCode {
     let store_dir = args
         .get(4)
         .cloned()
-        .unwrap_or_else(|| ".boomerang-store".to_string());
+        .unwrap_or_else(|| ".piggybank-store".to_string());
     let session = match Session::open(&store_dir) {
         Ok(s) => s,
         Err(e) => {
@@ -221,7 +228,7 @@ fn run_session_decompress(args: &[String]) -> ExitCode {
     let store_dir = args
         .get(3)
         .cloned()
-        .unwrap_or_else(|| ".boomerang-store".to_string());
+        .unwrap_or_else(|| ".piggybank-store".to_string());
     let session = match Session::open(&store_dir) {
         Ok(s) => s,
         Err(e) => {

@@ -1,4 +1,4 @@
-# Boomerang Roadmap
+# Piggybank Roadmap
 
 Novel features under consideration. Organized by impact tier.
 
@@ -10,7 +10,7 @@ Novel features under consideration. Organized by impact tier.
 Invert the model. Instead of "compress as much as you can," the caller says: "I have N bytes of budget — give me the highest information density you can fit." The server prioritizes anomalous/novel content and progressively elides the rest.
 
 - **New tool**: `compress_budget(content, max_bytes, key?)`
-- **Why it matters**: Makes Boomerang a *context management layer*, not just a compression utility. Every other tool produces output without knowing the remaining context budget. Boomerang is uniquely positioned to be the gatekeeper.
+- **Why it matters**: Makes Piggybank a *context management layer*, not just a compression utility. Every other tool produces output without knowing the remaining context budget. Piggybank is uniquely positioned to be the gatekeeper.
 - **Approach**: For text/logs, keep anomalous lines (non-modal templates) verbatim, collapse repetitive lines into counts, elide the middle. For JSON, keep the schema + outlier rows, elide homogeneous bulk. Falls back to normal compress if budget exceeds compressed size.
 
 ### 2. Streaming Append-Only Mode
@@ -27,9 +27,9 @@ Structural compression treats all lines equally. But `healthcheck OK × 500` is 
 - **Approach**: During text compression, build a frequency table of line templates. Lines matching the dominant template(s) are aggressively collapsed; outlier lines are always kept verbatim. Composable with existing dedup and elision.
 
 ### 4. Cross-Session Persistence (Warm Start)
-Keys survive across conversations. When a new session compresses `fleet-status`, Boomerang diffs against the *last known state from a previous session*.
+Keys survive across conversations. When a new session compresses `fleet-status`, Piggybank diffs against the *last known state from a previous session*.
 
-- **Why it matters**: The LLM gets "here's what changed since you last looked" without anyone remembering the old state. Turns Boomerang into lightweight agent memory for structured state.
+- **Why it matters**: The LLM gets "here's what changed since you last looked" without anyone remembering the old state. Turns Piggybank into lightweight agent memory for structured state.
 - **Approach**: Session already persists `.session.json` on disk. Extend so session state isn't cleared on process restart — the existing `Session::open` already does this. The missing piece is exposing a `last_seen_summary(key)` tool that returns "unchanged since <timestamp>" or a concise diff summary without requiring the caller to resend content.
 
 ---
@@ -40,7 +40,7 @@ Keys survive across conversations. When a new session compresses `fleet-status`,
 Check whether content has changed since last compression without sending the content at all.
 
 - **New tool**: `changed(key, hash)`
-- **Approach**: Client computes a cheap hash (sha256 of content), sends 64 bytes. Boomerang compares against the stored id for that key. Returns `{changed: bool, last_compressed_unix: u64}`. If unchanged, skip the compress call entirely — zero bytes transferred.
+- **Approach**: Client computes a cheap hash (sha256 of content), sends 64 bytes. Piggybank compares against the stored id for that key. Returns `{changed: bool, last_compressed_unix: u64}`. If unchanged, skip the compress call entirely — zero bytes transferred.
 
 ### 6. Content-Type Specializations
 Beyond JSON arrays and text logs:
@@ -57,7 +57,7 @@ Register a filter: "from `fleet-status`, only return nodes where `status != heal
 - **Approach**: Simple predicate expressions on JSON fields. Combined with session diffing: "since last check, jl3 went from healthy to degraded." Filtering happens before content hits the context window.
 
 ### 8. Multi-Agent Shared Store
-When multiple agents run in parallel (buddy worktrees, fleet ghosts), they share a single Boomerang store.
+When multiple agents run in parallel (buddy worktrees, fleet ghosts), they share a single Piggybank store.
 
 - **Why it matters**: Agent A compresses fleet-status; Agent B references the same key and gets a diff against what A already stored. No duplicate storage, cross-agent awareness.
 - **Status**: The store is already content-addressed on disk — two processes sharing a `--store-dir` already benefit from each other's history (tested and confirmed). The gap is session-level key tracking, which is per-process. Fix: move session state to a lockfile-guarded shared file, or accept that cross-agent sharing is store-level only (values) and session-level sharing (keys) requires explicit coordination.

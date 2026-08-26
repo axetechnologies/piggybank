@@ -7,7 +7,7 @@
 //! ignoring notifications (messages with no `id`, which get no response).
 //!
 //! Eight tools, named as clean verbs — the MCP server name already
-//! provides the namespace (`mcp__boomerang__compress`, etc.):
+//! provides the namespace (`mcp__piggybank__compress`, etc.):
 //!
 //! - `compress` — auto-detects JSON (lossless columnar) vs
 //!   text/logs (dedup + elision); pass `key` for session-aware diffing
@@ -22,11 +22,11 @@
 //! - `changed` — fingerprint check: compare a sha256 hash against
 //!   the last compressed content under a key, without resending it.
 //! - `compress_append` — streaming append: send only new bytes,
-//!   Boomerang concatenates with prior content under the key and returns
+//!   Piggybank concatenates with prior content under the key and returns
 //!   only the delta. Designed for tailing logs or polling builds.
 //! - `stats` — entry count and total bytes held in the store.
 
-use boomerang_core::{Session, Store, TextOptions};
+use piggybank_core::{Session, Store, TextOptions};
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -64,18 +64,67 @@ struct ServerState {
     skipped_resends: AtomicU64,
     append_bytes_avoided: AtomicU64,
     budget_enforcements: AtomicU64,
+    analytics_path: std::path::PathBuf,
 }
 
-pub fn serve(store_dir: &str) -> io::Result<()> {
+impl ServerState {
+    fn persist_analytics(&self) {
+        let data = serde_json::json!({
+            "total_original": self.total_original.load(Relaxed),
+            "total_compressed": self.total_compressed.load(Relaxed),
+            "compress_calls": self.compress_calls.load(Relaxed),
+            "skipped_resends": self.skipped_resends.load(Relaxed),
+            "append_bytes_avoided": self.append_bytes_avoided.load(Relaxed),
+            "budget_enforcements": self.budget_enforcements.load(Relaxed),
+        });
+        let tmp = self.analytics_path.with_extension(format!(
+            "json.{}.tmp",
+            std::process::id()
+        ));
+        if std::fs::write(&tmp, data.to_string().as_bytes()).is_ok() {
+            let _ = std::fs::rename(&tmp, &self.analytics_path);
+        }
+    }
+}
+
+fn load_counter(v: &Value, key: &str) -> AtomicU64 {
+    AtomicU64::new(v.get(key).and_then(|v| v.as_u64()).unwrap_or(0))
+}
+
+pub fn serve(store_dir: &str, gc_days: u64) -> io::Result<()> {
+    let analytics_path = std::path::Path::new(store_dir).join(".piggybank-analytics.json");
+    let saved: Value = std::fs::read(&analytics_path)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or(Value::Null);
+    let store = Store::open(store_dir)?;
+
+    if gc_days > 0 {
+        if let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            let cutoff = now.as_secs().saturating_sub(gc_days * 86400);
+            match store.gc(cutoff, false) {
+                Ok(r) if r.deleted > 0 => {
+                    eprintln!(
+                        "piggybank: auto-gc removed {} entries ({} bytes), older than {} days",
+                        r.deleted, r.freed_bytes, gc_days
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => eprintln!("piggybank: auto-gc failed (non-fatal): {e}"),
+            }
+        }
+    }
+
     let state = ServerState {
-        store: Store::open(store_dir)?,
         session: Session::open(store_dir)?,
-        total_original: AtomicU64::new(0),
-        total_compressed: AtomicU64::new(0),
-        compress_calls: AtomicU64::new(0),
-        skipped_resends: AtomicU64::new(0),
-        append_bytes_avoided: AtomicU64::new(0),
-        budget_enforcements: AtomicU64::new(0),
+        store,
+        total_original: load_counter(&saved, "total_original"),
+        total_compressed: load_counter(&saved, "total_compressed"),
+        compress_calls: load_counter(&saved, "compress_calls"),
+        skipped_resends: load_counter(&saved, "skipped_resends"),
+        append_bytes_avoided: load_counter(&saved, "append_bytes_avoided"),
+        budget_enforcements: load_counter(&saved, "budget_enforcements"),
+        analytics_path,
     };
 
     let stdin = io::stdin();
@@ -143,7 +192,7 @@ fn initialize_result() -> Value {
     json!({
         "protocolVersion": "2024-11-05",
         "capabilities": { "tools": {} },
-        "serverInfo": { "name": "boomerang", "version": env!("CARGO_PKG_VERSION") },
+        "serverInfo": { "name": "piggybank", "version": env!("CARGO_PKG_VERSION") },
     })
 }
 
@@ -286,13 +335,15 @@ fn record_and_savings(state: &ServerState, original: usize, compressed: usize) -
     let tot_comp = state.total_compressed.load(Relaxed);
     let saved = tot_orig.saturating_sub(tot_comp);
     let pct = if tot_orig > 0 { (saved as f64 / tot_orig as f64) * 100.0 } else { 0.0 };
-    json!({
+    let r = json!({
         "lifetime_calls": calls,
         "lifetime_original_bytes": tot_orig,
         "lifetime_compressed_bytes": tot_comp,
         "lifetime_saved_bytes": saved,
         "lifetime_saved_pct": format!("{pct:.1}%"),
-    })
+    });
+    state.persist_analytics();
+    r
 }
 
 fn handle_compress(state: &ServerState, args: &Value) -> Result<Value, String> {
@@ -308,7 +359,7 @@ fn handle_compress(state: &ServerState, args: &Value) -> Result<Value, String> {
     // a metadata object re-fetched unchanged) collapses to near-nothing the
     // moment it's seen again, in ANY later call, not just under one key.
     if let Ok(compressed) =
-        boomerang_core::compress_json_with_store(content.as_bytes(), &state.store)
+        piggybank_core::compress_json_with_store(content.as_bytes(), &state.store)
     {
         let savings = record_and_savings(state, content.len(), compressed.len());
         return Ok(json!({
@@ -328,7 +379,7 @@ fn handle_compress(state: &ServerState, args: &Value) -> Result<Value, String> {
             "session",
         ),
         None => (
-            boomerang_core::compress_text(
+            piggybank_core::compress_text(
                 &state.store,
                 content.as_bytes(),
                 &TextOptions::default(),
@@ -366,9 +417,9 @@ fn handle_verify(state: &ServerState, args: &Value) -> Result<Value, String> {
     let (kind, body) = decode_view(view)?;
 
     let result = match kind {
-        "json" => boomerang_core::verify_json_with_store(body.as_bytes(), &state.store)
+        "json" => piggybank_core::verify_json_with_store(body.as_bytes(), &state.store)
             .map_err(|e| e.to_string())?,
-        "text" => boomerang_core::verify_text_with_store(&state.store, body.as_bytes())
+        "text" => piggybank_core::verify_text_with_store(&state.store, body.as_bytes())
             .map_err(|e| e.to_string())?,
         "session" => state
             .session
@@ -390,9 +441,9 @@ fn handle_verify(state: &ServerState, args: &Value) -> Result<Value, String> {
 
 fn dispatch_decompress(state: &ServerState, kind: &str, body: &str) -> Result<Vec<u8>, String> {
     match kind {
-        "json" => boomerang_core::decompress_json_with_store(body.as_bytes(), &state.store)
+        "json" => piggybank_core::decompress_json_with_store(body.as_bytes(), &state.store)
             .map_err(|e| e.to_string()),
-        "text" => boomerang_core::decompress_text(&state.store, body.as_bytes())
+        "text" => piggybank_core::decompress_text(&state.store, body.as_bytes())
             .map_err(|e| e.to_string()),
         "session" => state
             .session
@@ -432,7 +483,7 @@ fn handle_compress_budget(state: &ServerState, args: &Value) -> Result<Value, St
         return Err("max_bytes must be >= 1".into());
     }
     let compressed =
-        boomerang_core::compress_text_budget(&state.store, content.as_bytes(), max_bytes)
+        piggybank_core::compress_text_budget(&state.store, content.as_bytes(), max_bytes)
             .map_err(|e| e.to_string())?;
     let within_budget = compressed.len() <= max_bytes;
     let normal_would_exceed = content.len() > max_bytes;
@@ -482,6 +533,7 @@ fn handle_changed(state: &ServerState, args: &Value) -> Result<Value, String> {
     let (changed, known) = state.session.check_changed(key, hash).map_err(|e| e.to_string())?;
     if known && !changed {
         state.skipped_resends.fetch_add(1, Relaxed);
+        state.persist_analytics();
     }
     Ok(json!({ "changed": changed, "known": known }))
 }

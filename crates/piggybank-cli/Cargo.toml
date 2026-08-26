@@ -1,12 +1,12 @@
 [package]
-name = "boomerang-cli"
+name = "piggybank-cli"
 version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "boomerang"
+name = "piggybank"
 path = "src/main.rs"
 
 [dependencies]
-boomerang-core = { path = "../boomerang-core" }
+piggybank-core = { path = "../piggybank-core" }
 serde_json = "1"

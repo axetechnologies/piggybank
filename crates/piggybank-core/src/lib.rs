@@ -134,7 +134,7 @@ impl Store {
     /// validation existed, `get("../../../../etc/passwd")` or an absolute
     /// path (`PathBuf::join` doesn't sanitize either — an absolute joined
     /// path *replaces* the base entirely) read arbitrary files off the
-    /// filesystem, reachable straight through the MCP `boomerang_retrieve`
+    /// filesystem, reachable straight through the MCP `piggybank_retrieve`
     /// tool. `put` always generates its own id via `hex::encode(sha256)`,
     /// so it's never handed an externally-controlled path fragment — only
     /// `get` needed this, but it needed it badly.
@@ -189,7 +189,7 @@ impl Store {
     /// that global picture, which nothing here has or could have. Age is a
     /// blunt instrument compared to that, but it's a *safe* one: it never
     /// second-guesses content, only how long it's been sitting there.
-    /// `boomerang_verify` exists precisely so a caller can check, before or
+    /// `piggybank_verify` exists precisely so a caller can check, before or
     /// after a GC run, whether something it still cares about survived.
     ///
     /// Entries with no provenance record (written before provenance
@@ -371,7 +371,7 @@ mod tests {
 
     #[test]
     fn store_put_get_round_trips_and_dedupes() {
-        let dir = std::env::temp_dir().join(format!("boomerang-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("piggybank-test-{}", std::process::id()));
         let store = Store::open(&dir).unwrap();
         let id1 = store.put(b"hello world").unwrap();
         let id2 = store.put(b"hello world").unwrap(); // identical content -> identical id, no rewrite
@@ -382,7 +382,7 @@ mod tests {
 
     #[test]
     fn store_stats_counts_content_ignores_non_id_files() {
-        let dir = std::env::temp_dir().join(format!("boomerang-stats-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("piggybank-stats-test-{}", std::process::id()));
         let store = Store::open(&dir).unwrap();
         store.put(b"hello").unwrap();
         store.put(b"world!!").unwrap();
@@ -403,7 +403,7 @@ mod tests {
         // plus the provenance sidecar, no leftover .tmp, and get() sees it
         // right away.
         let dir =
-            std::env::temp_dir().join(format!("boomerang-atomic-test-{}", std::process::id()));
+            std::env::temp_dir().join(format!("piggybank-atomic-test-{}", std::process::id()));
         let store = Store::open(&dir).unwrap();
         let id = store.put(b"atomic write check").unwrap();
         assert_eq!(store.get(&id).unwrap(), b"atomic write check");
@@ -425,11 +425,11 @@ mod tests {
     #[test]
     fn get_rejects_path_traversal_and_absolute_paths() {
         // Confirmed real (not theoretical) before this validation existed:
-        // reachable straight through the MCP boomerang_retrieve tool with
+        // reachable straight through the MCP piggybank_retrieve tool with
         // an attacker-controlled `ref`, this read files far outside the
         // store directory.
         let dir =
-            std::env::temp_dir().join(format!("boomerang-traversal-test-{}", std::process::id()));
+            std::env::temp_dir().join(format!("piggybank-traversal-test-{}", std::process::id()));
         let store = Store::open(&dir).unwrap();
         store.put(b"legitimate content").unwrap();
 
@@ -457,7 +457,7 @@ mod tests {
     #[test]
     fn first_seen_records_new_content_and_is_stable_across_duplicate_puts() {
         let dir =
-            std::env::temp_dir().join(format!("boomerang-provenance-test-{}", std::process::id()));
+            std::env::temp_dir().join(format!("piggybank-provenance-test-{}", std::process::id()));
         let store = Store::open(&dir).unwrap();
 
         // Content never written: no record, not an error.
@@ -496,7 +496,7 @@ mod tests {
     #[test]
     fn first_seen_rejects_invalid_ids_same_as_get() {
         let dir = std::env::temp_dir().join(format!(
-            "boomerang-provenance-validation-test-{}",
+            "piggybank-provenance-validation-test-{}",
             std::process::id()
         ));
         let store = Store::open(&dir).unwrap();
@@ -509,7 +509,7 @@ mod tests {
     #[test]
     fn exists_matches_get_availability_and_rejects_invalid_ids() {
         let dir =
-            std::env::temp_dir().join(format!("boomerang-exists-test-{}", std::process::id()));
+            std::env::temp_dir().join(format!("piggybank-exists-test-{}", std::process::id()));
         let store = Store::open(&dir).unwrap();
 
         let never_written = "b".repeat(64);
@@ -527,7 +527,7 @@ mod tests {
 
     #[test]
     fn gc_deletes_only_content_older_than_cutoff_with_a_recorded_age() {
-        let dir = std::env::temp_dir().join(format!("boomerang-gc-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("piggybank-gc-test-{}", std::process::id()));
         let store = Store::open(&dir).unwrap();
 
         let old_id = store.put(b"old content").unwrap();
@@ -575,7 +575,7 @@ mod tests {
     #[test]
     fn gc_dry_run_reports_without_deleting_or_rewriting_provenance() {
         let dir =
-            std::env::temp_dir().join(format!("boomerang-gc-dryrun-test-{}", std::process::id()));
+            std::env::temp_dir().join(format!("piggybank-gc-dryrun-test-{}", std::process::id()));
         let store = Store::open(&dir).unwrap();
         let id = store.put(b"should survive the dry run").unwrap();
         fs::write(

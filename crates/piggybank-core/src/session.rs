@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Error, ErrorKind};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 /// Cap on `lcs_diff`'s DP table size ((old_lines+1)*(new_lines+1) usize
 /// cells) before `compress` gives up on diffing and falls back to sending
@@ -27,6 +28,52 @@ const MAX_DIFF_CELLS: u64 = 16_000_000;
 /// the caller telling us) would need content-addressed lookup across all
 /// keys, which is a real extension but not needed for the common case of
 /// "the same file, re-read."
+/// Advisory file lock using `create_new` as an atomic test-and-set.
+/// Automatically released on drop. Stale locks (from crashed processes)
+/// are detected by mtime and removed after 10 seconds.
+struct FileLock {
+    path: PathBuf,
+}
+
+impl FileLock {
+    fn acquire(path: &Path) -> io::Result<Self> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+            {
+                Ok(_file) => return Ok(FileLock { path: path.to_path_buf() }),
+                Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+                    if let Ok(meta) = fs::metadata(path) {
+                        if let Ok(modified) = meta.modified() {
+                            if modified.elapsed().unwrap_or_default() > Duration::from_secs(10) {
+                                let _ = fs::remove_file(path);
+                                continue;
+                            }
+                        }
+                    }
+                    if Instant::now() > deadline {
+                        return Err(Error::new(
+                            ErrorKind::TimedOut,
+                            "session lock acquisition timed out",
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
 pub struct Session {
     store: Store,
     last_seen: RefCell<HashMap<String, String>>,
@@ -69,9 +116,36 @@ impl Session {
         let Some(path) = &self.state_path else {
             return Ok(());
         };
-        let bytes = serde_json::to_vec(&*self.last_seen.borrow())
+        let lock_path = path.with_extension("json.lock");
+        let _lock = FileLock::acquire(&lock_path)?;
+
+        // Merge: on-disk state as base, our keys overwrite.
+        let on_disk: HashMap<String, String> = fs::read(path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default();
+
+        let our_state: Vec<(String, String)> = self
+            .last_seen
+            .borrow()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+
+        let mut merged = on_disk;
+        for (k, v) in our_state {
+            merged.insert(k, v);
+        }
+
+        *self.last_seen.borrow_mut() = merged.clone();
+
+        let bytes = serde_json::to_vec(&merged)
             .map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
-        fs::write(path, bytes)
+
+        // Atomic write: temp file + rename prevents torn reads.
+        let tmp_path = path.with_extension(format!("json.{}.tmp", std::process::id()));
+        fs::write(&tmp_path, &bytes)?;
+        fs::rename(&tmp_path, path)
     }
 
     /// Compress `content` under `key` relative to whatever this session
@@ -185,7 +259,7 @@ impl Session {
     }
 
     /// Append-only compression: the caller sends only *new* bytes, and
-    /// Boomerang concatenates them with whatever was last stored under
+    /// Piggybank concatenates them with whatever was last stored under
     /// `key`. The full accumulated content is written to the store (so
     /// a future `compress` or `decompress` against this key sees
     /// everything), but the returned view contains only the new bytes
@@ -420,7 +494,7 @@ mod tests {
 
     fn temp_store() -> Store {
         let dir = std::env::temp_dir().join(format!(
-            "boomerang-session-test-{:?}-{}",
+            "piggybank-session-test-{:?}-{}",
             std::time::SystemTime::now(),
             std::process::id()
         ));
@@ -727,6 +801,46 @@ mod tests {
         assert!(session
             .check_changed("f.txt", &"g".repeat(64))
             .is_err()); // 'g' is not a hex digit
+    }
+
+    fn temp_session_dir() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "piggybank-session-test-{:?}-{}",
+            std::time::SystemTime::now(),
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn two_sessions_sharing_a_store_dir_merge_keys() {
+        let dir = temp_session_dir();
+        fs::create_dir_all(&dir).unwrap();
+
+        let s1 = Session::open(&dir).unwrap();
+        s1.compress("agent-a.rs", b"content a").unwrap();
+
+        let s2 = Session::open(&dir).unwrap();
+        s2.compress("agent-b.rs", b"content b").unwrap();
+
+        // s2 should have merged s1's key into its state on persist.
+        let on_disk: HashMap<String, String> =
+            serde_json::from_slice(&fs::read(dir.join(".session.json")).unwrap()).unwrap();
+        assert!(on_disk.contains_key("agent-a.rs"), "s1's key must survive s2's persist");
+        assert!(on_disk.contains_key("agent-b.rs"), "s2's key must be present");
+    }
+
+    #[test]
+    fn lock_is_released_on_drop() {
+        let dir = temp_session_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let lock_path = dir.join("test.lock");
+        {
+            let _lock = FileLock::acquire(&lock_path).unwrap();
+            assert!(lock_path.exists());
+        }
+        assert!(!lock_path.exists(), "lock file must be removed on drop");
+        // Second acquire should succeed immediately after drop.
+        let _lock2 = FileLock::acquire(&lock_path).unwrap();
     }
 
     mod proptests {
