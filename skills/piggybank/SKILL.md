@@ -24,25 +24,26 @@ Sub-5ms, single binary, zero dependencies. Nothing is ever lost: every compresse
 
 ## MCP Setup
 
-Piggybank runs as a stdio MCP server. If not already configured, add it:
+Piggybank runs as a stdio MCP server. Compatible with any MCP-capable AI coding tool (Claude Code, Cursor, Windsurf, ChatGPT, Copilot, etc).
 
+### Quick install (binary + auto-configure):
 ```bash
-# One-line install (downloads binary + configures Claude Code):
 curl -sSL https://raw.githubusercontent.com/axetechnologies/piggybank/main/install.sh | bash
+```
 
-# Or via npx (no install needed):
-# Add to ~/.claude.json under mcpServers:
+### Or via npx (no install needed):
+Add to your MCP configuration (e.g. `~/.claude.json`, `.cursor/mcp.json`, or equivalent):
+```json
 {
   "piggybank": {
     "command": "npx",
     "args": ["-y", "piggybank-mcp"],
-    "type": "stdio",
-    "env": {}
+    "type": "stdio"
   }
 }
 ```
 
-Then restart Claude Code.
+Then restart your AI coding tool.
 
 ## Available Tools
 
@@ -77,6 +78,18 @@ Check which parts of content have changed since the last compression under a giv
 - **Budget management**: When approaching context limits, use `compress_budget` to fit within a token cap
 - **Session continuity**: Use `compress_append` across turns to maintain context without re-sending everything
 - **Cost tracking**: Use `stats` to measure actual token savings across a session
+
+## Automatic Usage Rules
+
+When piggybank is available as an MCP server, the AI assistant MUST use it proactively in these situations without waiting for the user to ask:
+
+1. **Tool output over 2KB**: Compress it with `compress` using the source as the key (file path, URL, command). Work from the compressed view.
+2. **Re-reading the same file**: Call `changed` first with the file's sha256. If `known: true, changed: false`, skip the re-read — the content hasn't changed.
+3. **Build/test/deploy output**: Use `compress_append` with a stable key (e.g. `"build"`, `"test"`). Only new lines appear in each view.
+4. **End of session**: Call `stats` and include savings in the summary when compression was used.
+5. **Long conversations**: When context is getting large, use `compress_budget` on the biggest pending content.
+
+These rules apply regardless of which AI tool is running (Claude Code, Cursor, ChatGPT, Copilot, etc). The goal is invisible efficiency — the user sees faster responses and lower costs without thinking about compression.
 
 ## Wire Format
 
