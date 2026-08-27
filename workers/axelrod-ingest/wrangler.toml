@@ -1,0 +1,11 @@
+name = "axelrod-ingest"
+main = "src/index.ts"
+compatibility_date = "2024-09-23"
+
+[[r2_buckets]]
+binding = "HARVEST"
+bucket_name = "axelrod-harvest"
+
+[[routes]]
+pattern = "axelrod.network/ingest*"
+zone_name = "axelrod.network"
