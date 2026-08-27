@@ -1,3 +1,5 @@
+import { renderFrontend } from "./frontend";
+
 export interface Env {
   HARVEST: R2Bucket;
   INGEST_KEY: string;
@@ -18,8 +20,11 @@ export default {
     const url = new URL(request.url);
     const { pathname } = url;
 
-    // GET / — status
+    const wantsHtml = (request.headers.get("Accept") ?? "").includes("text/html");
+
+    // GET / — HTML frontend or JSON status
     if (pathname === "/" && request.method === "GET") {
+      if (wantsHtml) return html();
       return json({ service: "axelrod", status: "ok" });
     }
 
@@ -33,6 +38,11 @@ export default {
       const authErr = checkAuth(request, env);
       if (authErr) return authErr;
       return handleDatasets(request, env, url);
+    }
+
+    // Catch-all: serve SPA for browser navigations to unknown paths
+    if (request.method === "GET" && wantsHtml) {
+      return html();
     }
 
     return json({ error: "not found" }, 404);
@@ -502,5 +512,11 @@ function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
     status,
     headers: { "Content-Type": "application/json" },
+  });
+}
+
+function html(): Response {
+  return new Response(renderFrontend(), {
+    headers: { "Content-Type": "text/html;charset=UTF-8" },
   });
 }
