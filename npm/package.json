@@ -5,13 +5,17 @@
   "license": "MIT",
   "repository": "memjar/piggybank",
   "homepage": "https://github.com/memjar/piggybank",
-  "keywords": ["mcp", "claude", "compression", "ai", "agents", "context-window"],
+  "keywords": ["mcp", "claude", "compression", "ai", "agents", "context-window", "token-savings"],
   "bin": {
     "piggybank-mcp": "bin/cli.js"
   },
+  "files": ["bin/"],
   "scripts": {
     "postinstall": "node bin/install.js"
   },
   "os": ["darwin", "linux"],
-  "cpu": ["x64", "arm64"]
+  "cpu": ["x64", "arm64"],
+  "engines": {
+    "node": ">=16"
+  }
 }
