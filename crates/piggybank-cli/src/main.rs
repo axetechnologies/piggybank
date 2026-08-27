@@ -1,4 +1,5 @@
 mod mcp;
+mod proxy;
 
 use piggybank_core::{Session, Store, TextOptions};
 use std::env;
@@ -17,6 +18,7 @@ fn main() -> ExitCode {
         Some("decompress-session") => run_session_decompress(&args),
         Some("mcp") if args.get(2).map(String::as_str) == Some("serve") => run_mcp_serve(&args),
         Some("gc") => run_gc(&args),
+        Some("proxy") => run_proxy(&args),
         _ => {
             usage();
             ExitCode::FAILURE
@@ -34,6 +36,20 @@ fn usage() {
     eprintln!("       piggybankmcp serve [--store-dir <path>] [--gc-days <N>]     # MCP server over stdio (auto-GC: default 7d, 0=off)");
     eprintln!("       piggybankgc <store-dir> --older-than-days <N> [--dry-run]   # delete content first seen more than N days ago");
     eprintln!("                                                                    # (explicit, human-invoked only - never exposed over MCP)");
+    eprintln!("       piggybank proxy [--threshold <bytes>] [--store-dir <path>] -- <cmd> [args...]");
+    eprintln!("                                                                    # transparent MCP proxy with auto-compression");
+}
+
+fn run_proxy(args: &[String]) -> ExitCode {
+    // args[0] is "piggybank", args[1] is "proxy"; pass everything from args[2] onward.
+    let proxy_args: Vec<String> = args[2..].to_vec();
+    match proxy::run_proxy_from_args(&proxy_args) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("piggybank proxy error: {e}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 fn run_gc(args: &[String]) -> ExitCode {

@@ -52,6 +52,36 @@ pub enum HarvestEvent {
         auto_compressed: bool,
         compression_ratio: Option<f64>,
     },
+    #[serde(rename = "subagent_spawn")]
+    SubagentSpawn {
+        ts: u64,
+        session_id: String,
+        agent_id: String,
+        agent_type: String,
+        prompt_bytes: usize,
+        parent_context_bytes: usize,
+    },
+    #[serde(rename = "subagent_complete")]
+    SubagentComplete {
+        ts: u64,
+        session_id: String,
+        agent_id: String,
+        agent_type: String,
+        result_bytes: usize,
+        tool_calls: u64,
+        duration_ms: u64,
+        input_tokens: u64,
+        output_tokens: u64,
+    },
+    #[serde(rename = "context_transfer")]
+    ContextTransfer {
+        ts: u64,
+        session_id: String,
+        direction: String, // "parent_to_child", "child_to_parent"
+        bytes: usize,
+        compressed_bytes: Option<usize>,
+        agent_id: String,
+    },
     #[serde(rename = "session_end")]
     SessionEnd {
         ts: u64,
@@ -60,6 +90,8 @@ pub enum HarvestEvent {
         total_original_bytes: u64,
         total_compressed_bytes: u64,
         saved_pct: f64,
+        subagents_spawned: u64,
+        subagent_total_tokens: u64,
     },
 }
 
@@ -152,6 +184,8 @@ mod tests {
             total_original_bytes: 100,
             total_compressed_bytes: 50,
             saved_pct: 50.0,
+            subagents_spawned: 0,
+            subagent_total_tokens: 0,
         });
     }
 
@@ -177,6 +211,8 @@ mod tests {
                 total_original_bytes: 400,
                 total_compressed_bytes: 200,
                 saved_pct: 50.0,
+                subagents_spawned: 0,
+                subagent_total_tokens: 0,
             });
         }
 
