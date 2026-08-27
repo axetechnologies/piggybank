@@ -239,11 +239,7 @@ fn line_anomaly_score(line: &str) -> u32 {
     score
 }
 
-fn build_anomaly_view(
-    store: &Store,
-    lines: &[&str],
-    keep: &[bool],
-) -> std::io::Result<Vec<u8>> {
+fn build_anomaly_view(store: &Store, lines: &[&str], keep: &[bool]) -> std::io::Result<Vec<u8>> {
     let mut out: Vec<String> = Vec::new();
     let mut gap_start: Option<usize> = None;
 
@@ -638,10 +634,16 @@ mod tests {
         let store = temp_store();
         let mut lines: Vec<String> = Vec::new();
         for i in 0..200 {
-            lines.push(format!("2024-01-15T10:00:{:02}Z INFO: healthcheck passed, latency={}ms", i % 60, 2 + i));
+            lines.push(format!(
+                "2024-01-15T10:00:{:02}Z INFO: healthcheck passed, latency={}ms",
+                i % 60,
+                2 + i
+            ));
         }
         lines[50] = "2024-01-15T10:00:50Z ERROR: database connection timeout after 30s, all retries exhausted".to_string();
-        lines[120] = "2024-01-15T10:02:00Z FATAL: out of memory, heap dump written to /tmp/heap.hprof".to_string();
+        lines[120] =
+            "2024-01-15T10:02:00Z FATAL: out of memory, heap dump written to /tmp/heap.hprof"
+                .to_string();
         lines[180] = "2024-01-15T10:03:00Z WARN: request queue depth exceeds threshold, applying backpressure".to_string();
         let input = lines.join("\n");
 

@@ -37,7 +37,12 @@ const REPORT_EVERY_N_CALLS: u64 = 10;
 const VIEW_VERSION: u8 = 1;
 
 fn encode_view(kind: &str, compressed: &[u8]) -> String {
-    format!("BOOM:{}:{}\n{}", VIEW_VERSION, kind, String::from_utf8_lossy(compressed))
+    format!(
+        "BOOM:{}:{}\n{}",
+        VIEW_VERSION,
+        kind,
+        String::from_utf8_lossy(compressed)
+    )
 }
 
 fn decode_view(view: &str) -> Result<(&str, &str), String> {
@@ -50,7 +55,9 @@ fn decode_view(view: &str) -> Result<(&str, &str), String> {
     }
     let version: u8 = parts[1].parse().map_err(|_| "invalid view: bad version")?;
     if version != VIEW_VERSION {
-        return Err(format!("unsupported view version: {version} (expected {VIEW_VERSION})"));
+        return Err(format!(
+            "unsupported view version: {version} (expected {VIEW_VERSION})"
+        ));
     }
     Ok((parts[2], body))
 }
@@ -82,10 +89,9 @@ impl ServerState {
             "append_bytes_avoided": self.append_bytes_avoided.load(Relaxed),
             "budget_enforcements": self.budget_enforcements.load(Relaxed),
         });
-        let tmp = self.analytics_path.with_extension(format!(
-            "json.{}.tmp",
-            std::process::id()
-        ));
+        let tmp = self
+            .analytics_path
+            .with_extension(format!("json.{}.tmp", std::process::id()));
         if std::fs::write(&tmp, data.to_string().as_bytes()).is_ok() {
             let _ = std::fs::rename(&tmp, &self.analytics_path);
         }
@@ -156,12 +162,17 @@ impl ServerState {
             let _ = std::process::Command::new("curl")
                 .args([
                     "-sf",
-                    "-X", "POST",
+                    "-X",
+                    "POST",
                     BRAIN_URL,
-                    "-H", "Content-Type: application/json",
-                    "-H", &format!("X-AXE-Key: {brain_key_clone}"),
-                    "-d", &payload_str,
-                    "--max-time", "5",
+                    "-H",
+                    "Content-Type: application/json",
+                    "-H",
+                    &format!("X-AXE-Key: {brain_key_clone}"),
+                    "-d",
+                    &payload_str,
+                    "--max-time",
+                    "5",
                 ])
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
@@ -411,10 +422,7 @@ fn handle_tools_call(state: &ServerState, id: Value, request: &Value) -> Value {
                 Value::String(s) => s,
                 other => other.to_string(),
             };
-            ok(
-                id,
-                json!({ "content": [{ "type": "text", "text": text }] }),
-            )
+            ok(id, json!({ "content": [{ "type": "text", "text": text }] }))
         }
         Err(message) => ok(
             id,
@@ -430,7 +438,11 @@ fn record_and_savings(state: &ServerState, original: usize, compressed: usize) -
     let tot_orig = state.total_original.load(Relaxed);
     let tot_comp = state.total_compressed.load(Relaxed);
     let saved = tot_orig.saturating_sub(tot_comp);
-    let pct = if tot_orig > 0 { (saved as f64 / tot_orig as f64) * 100.0 } else { 0.0 };
+    let pct = if tot_orig > 0 {
+        (saved as f64 / tot_orig as f64) * 100.0
+    } else {
+        0.0
+    };
     let r = json!({
         "lifetime_calls": calls,
         "lifetime_original_bytes": tot_orig,
@@ -502,7 +514,9 @@ fn handle_decompress(state: &ServerState, args: &Value) -> Result<Value, String>
     let (kind, body) = decode_view(view)?;
 
     let restored = dispatch_decompress(state, kind, body)?;
-    Ok(Value::String(String::from_utf8_lossy(&restored).into_owned()))
+    Ok(Value::String(
+        String::from_utf8_lossy(&restored).into_owned(),
+    ))
 }
 
 fn handle_verify(state: &ServerState, args: &Value) -> Result<Value, String> {
@@ -612,7 +626,9 @@ fn handle_compress_append(state: &ServerState, args: &Value) -> Result<Value, St
         .append(key, new_bytes)
         .map_err(|e| e.to_string())?;
     if accumulated_size > 0 {
-        state.append_bytes_avoided.fetch_add(accumulated_size as u64, Relaxed);
+        state
+            .append_bytes_avoided
+            .fetch_add(accumulated_size as u64, Relaxed);
     }
     let savings = record_and_savings(state, new_bytes.len(), view_bytes.len());
     Ok(json!({
@@ -624,9 +640,18 @@ fn handle_compress_append(state: &ServerState, args: &Value) -> Result<Value, St
 }
 
 fn handle_changed(state: &ServerState, args: &Value) -> Result<Value, String> {
-    let key = args.get("key").and_then(Value::as_str).ok_or("missing 'key' argument")?;
-    let hash = args.get("hash").and_then(Value::as_str).ok_or("missing 'hash' argument")?;
-    let (changed, known) = state.session.check_changed(key, hash).map_err(|e| e.to_string())?;
+    let key = args
+        .get("key")
+        .and_then(Value::as_str)
+        .ok_or("missing 'key' argument")?;
+    let hash = args
+        .get("hash")
+        .and_then(Value::as_str)
+        .ok_or("missing 'hash' argument")?;
+    let (changed, known) = state
+        .session
+        .check_changed(key, hash)
+        .map_err(|e| e.to_string())?;
     if known && !changed {
         state.skipped_resends.fetch_add(1, Relaxed);
         state.persist_analytics();
@@ -640,7 +665,11 @@ fn handle_stats(state: &ServerState) -> Result<Value, String> {
     let tot_orig = state.total_original.load(Relaxed);
     let tot_comp = state.total_compressed.load(Relaxed);
     let saved = tot_orig.saturating_sub(tot_comp);
-    let pct = if tot_orig > 0 { (saved as f64 / tot_orig as f64) * 100.0 } else { 0.0 };
+    let pct = if tot_orig > 0 {
+        (saved as f64 / tot_orig as f64) * 100.0
+    } else {
+        0.0
+    };
     let append_avoided = state.append_bytes_avoided.load(Relaxed);
     let total_bytes_saved = saved + append_avoided;
     let tokens_saved = total_bytes_saved as f64 / BYTES_PER_TOKEN;

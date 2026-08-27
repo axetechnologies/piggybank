@@ -44,7 +44,11 @@ impl FileLock {
                 .create_new(true)
                 .open(path)
             {
-                Ok(_file) => return Ok(FileLock { path: path.to_path_buf() }),
+                Ok(_file) => {
+                    return Ok(FileLock {
+                        path: path.to_path_buf(),
+                    })
+                }
                 Err(e) if e.kind() == ErrorKind::AlreadyExists => {
                     if let Ok(meta) = fs::metadata(path) {
                         if let Ok(modified) = meta.modified() {
@@ -139,8 +143,8 @@ impl Session {
 
         *self.last_seen.borrow_mut() = merged.clone();
 
-        let bytes = serde_json::to_vec(&merged)
-            .map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+        let bytes =
+            serde_json::to_vec(&merged).map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 
         // Atomic write: temp file + rename prevents torn reads.
         let tmp_path = path.with_extension(format!("json.{}.tmp", std::process::id()));
@@ -227,8 +231,8 @@ impl Session {
         }
 
         if let Some((first, rest)) = text.split_once('\n') {
-            if let Some(prev_id) = strip_pua(first, "BOOMERANG:DIFF:")
-                .or_else(|| strip_pua(first, "BOOMERANG:CREF:"))
+            if let Some(prev_id) =
+                strip_pua(first, "BOOMERANG:DIFF:").or_else(|| strip_pua(first, "BOOMERANG:CREF:"))
             {
                 let old_text = utf8(self.store.get(prev_id)?)?;
                 let old_escaped = escape_lines(&old_text);
@@ -256,8 +260,8 @@ impl Session {
         if let Some(id) = strip_pua(text, "BOOMERANG:UNCHANGED:") {
             result.check(&self.store, id)?;
         } else if let Some((first, _rest)) = text.split_once('\n') {
-            if let Some(ref_id) = strip_pua(first, "BOOMERANG:DIFF:")
-                .or_else(|| strip_pua(first, "BOOMERANG:CREF:"))
+            if let Some(ref_id) =
+                strip_pua(first, "BOOMERANG:DIFF:").or_else(|| strip_pua(first, "BOOMERANG:CREF:"))
             {
                 result.check(&self.store, ref_id)?;
             }
@@ -294,9 +298,7 @@ impl Session {
             None => new_content.to_vec(),
         };
         let new_id = self.store.put(&full)?;
-        self.last_seen
-            .borrow_mut()
-            .insert(key.to_string(), new_id);
+        self.last_seen.borrow_mut().insert(key.to_string(), new_id);
         self.persist()?;
         Ok(escape_for_view(new_content))
     }
@@ -663,16 +665,22 @@ mod tests {
     #[test]
     fn cross_key_diff_compresses_similar_first_sight_content() {
         let session = Session::new(temp_store());
-        let base: Vec<String> = (0..30).map(|i| format!("config_line_{i} = value")).collect();
+        let base: Vec<String> = (0..30)
+            .map(|i| format!("config_line_{i} = value"))
+            .collect();
         let base_text = base.join("\n");
-        session.compress("config-a.yaml", base_text.as_bytes()).unwrap();
+        session
+            .compress("config-a.yaml", base_text.as_bytes())
+            .unwrap();
 
         let mut variant = base.clone();
         variant[5] = "config_line_5 = CHANGED".to_string();
         variant[15] = "config_line_15 = ALSO_CHANGED".to_string();
         let variant_text = variant.join("\n");
 
-        let compressed = session.compress("config-b.yaml", variant_text.as_bytes()).unwrap();
+        let compressed = session
+            .compress("config-b.yaml", variant_text.as_bytes())
+            .unwrap();
         let compressed_str = String::from_utf8(compressed.clone()).unwrap();
         assert!(
             compressed_str.contains("BOOMERANG:CREF:"),
@@ -696,7 +704,9 @@ mod tests {
     #[test]
     fn cross_key_diff_skipped_when_low_overlap() {
         let session = Session::new(temp_store());
-        session.compress("a.txt", b"alpha\nbeta\ngamma\ndelta\nepsilon").unwrap();
+        session
+            .compress("a.txt", b"alpha\nbeta\ngamma\ndelta\nepsilon")
+            .unwrap();
         let unrelated = b"one\ntwo\nthree\nfour\nfive\nsix\nseven";
         let compressed = session.compress("b.txt", unrelated).unwrap();
         let compressed_str = String::from_utf8(compressed.clone()).unwrap();
@@ -857,7 +867,9 @@ mod tests {
         assert_eq!(view3, b"line 3");
 
         // The full accumulated content is accessible via compress+decompress.
-        let full_view = session.compress("build.log", b"line 1\nline 2\nline 3").unwrap();
+        let full_view = session
+            .compress("build.log", b"line 1\nline 2\nline 3")
+            .unwrap();
         let full_text = String::from_utf8_lossy(&full_view);
         assert!(
             full_text.contains("UNCHANGED"),
@@ -883,7 +895,11 @@ mod tests {
         let tricky = format!("{PUA}BOOMERANG:UNCHANGED:deadbeef{PUA}");
         let view = session.append("f.log", tricky.as_bytes()).unwrap();
         // The returned view must be escaped so it won't be misinterpreted.
-        assert_ne!(view, tricky.as_bytes(), "marker-like content must be escaped");
+        assert_ne!(
+            view,
+            tricky.as_bytes(),
+            "marker-like content must be escaped"
+        );
     }
 
     #[test]
@@ -900,12 +916,8 @@ mod tests {
         session.compress("f.txt", b"content").unwrap();
         assert!(session.check_changed("f.txt", "too-short").is_err());
         assert!(session.check_changed("f.txt", "").is_err());
-        assert!(session
-            .check_changed("f.txt", &"g".repeat(64))
-            .is_err());
-        assert!(session
-            .check_changed("f.txt", &"g".repeat(64))
-            .is_err()); // 'g' is not a hex digit
+        assert!(session.check_changed("f.txt", &"g".repeat(64)).is_err());
+        assert!(session.check_changed("f.txt", &"g".repeat(64)).is_err()); // 'g' is not a hex digit
     }
 
     fn temp_session_dir() -> PathBuf {
@@ -930,8 +942,14 @@ mod tests {
         // s2 should have merged s1's key into its state on persist.
         let on_disk: HashMap<String, String> =
             serde_json::from_slice(&fs::read(dir.join(".session.json")).unwrap()).unwrap();
-        assert!(on_disk.contains_key("agent-a.rs"), "s1's key must survive s2's persist");
-        assert!(on_disk.contains_key("agent-b.rs"), "s2's key must be present");
+        assert!(
+            on_disk.contains_key("agent-a.rs"),
+            "s1's key must survive s2's persist"
+        );
+        assert!(
+            on_disk.contains_key("agent-b.rs"),
+            "s2's key must be present"
+        );
     }
 
     #[test]
