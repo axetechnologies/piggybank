@@ -7,5 +7,5 @@ binding = "HARVEST"
 bucket_name = "axelrod-harvest"
 
 [[routes]]
-pattern = "axelrod.network/ingest*"
+pattern = "axelrod.network/*"
 zone_name = "axelrod.network"

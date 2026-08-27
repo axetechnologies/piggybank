@@ -26,6 +26,8 @@
 //!   only the delta. Designed for tailing logs or polling builds.
 //! - `stats` — entry count and total bytes held in the store.
 
+use piggybank_core::harvest::{HarvestEvent, Harvester};
+use piggybank_core::harvest;
 use piggybank_core::{Session, Store, TextOptions};
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
@@ -77,6 +79,7 @@ struct ServerState {
     analytics_path: std::path::PathBuf,
     hostname: String,
     last_reported_calls: AtomicU64,
+    harvester: Harvester,
 }
 
 impl ServerState {
@@ -195,7 +198,7 @@ fn load_counter(v: &Value, key: &str) -> AtomicU64 {
     AtomicU64::new(v.get(key).and_then(|v| v.as_u64()).unwrap_or(0))
 }
 
-pub fn serve(store_dir: &str, gc_days: u64) -> io::Result<()> {
+pub fn serve(store_dir: &str, gc_days: u64, harvest_path: Option<&str>, harvest_url: Option<&str>) -> io::Result<()> {
     let analytics_path = std::path::Path::new(store_dir).join(".piggybank-analytics.json");
     let saved: Value = std::fs::read(&analytics_path)
         .ok()
@@ -220,6 +223,13 @@ pub fn serve(store_dir: &str, gc_days: u64) -> io::Result<()> {
     }
 
     let hostname = gethostname();
+    let harvester = if let Some(url) = harvest_url {
+        Harvester::new_http(url)
+    } else if let Some(path) = harvest_path {
+        Harvester::new_file(std::path::Path::new(path))?
+    } else {
+        Harvester::new_null()
+    };
     let state = ServerState {
         session: Session::open(store_dir)?,
         store,
@@ -232,6 +242,7 @@ pub fn serve(store_dir: &str, gc_days: u64) -> io::Result<()> {
         analytics_path,
         hostname,
         last_reported_calls: AtomicU64::new(0),
+        harvester,
     };
 
     let stdin = io::stdin();
@@ -472,6 +483,20 @@ fn handle_compress(state: &ServerState, args: &Value) -> Result<Value, String> {
         if let Some(k) = key {
             state.session.record_content_hash(k, content.as_bytes());
         }
+        let ratio = if content.len() > 0 {
+            compressed.len() as f64 / content.len() as f64
+        } else {
+            1.0
+        };
+        state.harvester.log(HarvestEvent::Compress {
+            ts: harvest::now(),
+            session_id: state.harvester.session_id().to_string(),
+            key: key.map(|s| s.to_string()),
+            original_bytes: content.len(),
+            compressed_bytes: compressed.len(),
+            ratio,
+            content_type: "json".to_string(),
+        });
         let savings = record_and_savings(state, content.len(), compressed.len());
         return Ok(json!({
             "view": encode_view("json", &compressed),
@@ -500,6 +525,20 @@ fn handle_compress(state: &ServerState, args: &Value) -> Result<Value, String> {
         ),
     };
 
+    let ratio = if content.len() > 0 {
+        compressed.len() as f64 / content.len() as f64
+    } else {
+        1.0
+    };
+    state.harvester.log(HarvestEvent::Compress {
+        ts: harvest::now(),
+        session_id: state.harvester.session_id().to_string(),
+        key: key.map(|s| s.to_string()),
+        original_bytes: content.len(),
+        compressed_bytes: compressed.len(),
+        ratio,
+        content_type: kind.to_string(),
+    });
     let savings = record_and_savings(state, content.len(), compressed.len());
     Ok(json!({
         "view": encode_view(kind, &compressed),
@@ -514,9 +553,16 @@ fn handle_decompress(state: &ServerState, args: &Value) -> Result<Value, String>
         .get("view")
         .and_then(Value::as_str)
         .ok_or("missing 'view' argument")?;
+    let view_bytes = view.len();
     let (kind, body) = decode_view(view)?;
 
     let restored = dispatch_decompress(state, kind, body)?;
+    state.harvester.log(HarvestEvent::Decompress {
+        ts: harvest::now(),
+        session_id: state.harvester.session_id().to_string(),
+        view_bytes,
+        restored_bytes: restored.len(),
+    });
     Ok(Value::String(
         String::from_utf8_lossy(&restored).into_owned(),
     ))

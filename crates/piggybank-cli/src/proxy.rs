@@ -8,6 +8,8 @@
 //! Usage:
 //!   piggybank proxy [--threshold <bytes>] [--store-dir <path>] -- <command> [args...]
 
+use piggybank_core::harvest::{HarvestEvent, Harvester};
+use piggybank_core::harvest;
 use piggybank_core::{Session, Store, TextOptions};
 use serde_json::{json, Value};
 use std::io::{self, BufRead, BufReader, Write};
@@ -34,7 +36,7 @@ struct ProxyState {
     store: Store,
     session: Session,
     threshold: usize,
-    // harvest: Option<piggybank_core::harvest::Harvester>,  // future: harvest integration
+    harvester: Harvester,
 }
 
 fn spawn_child(command: &str, args: &[String]) -> io::Result<Child> {
@@ -621,8 +623,53 @@ fn handle_message(state: &mut ProxyState, msg: &Value) -> io::Result<Option<Valu
                 send_to_child(state, &child_req)?;
                 let mut child_resp = read_from_child(state)?;
 
+                // Measure result before and after auto-compression.
+                let pre_compress_text = child_resp
+                    .get("result")
+                    .and_then(|r| r.get("content"))
+                    .and_then(|c| c.get(0))
+                    .and_then(|item| item.get("text"))
+                    .and_then(Value::as_str)
+                    .map(|s| s.len());
+
                 // Auto-compress if response is large.
                 maybe_compress_response(state, &mut child_resp);
+
+                // Emit ToolCall harvest event.
+                let post_compress_text = child_resp
+                    .get("result")
+                    .and_then(|r| r.get("content"))
+                    .and_then(|c| c.get(0))
+                    .and_then(|item| item.get("text"))
+                    .and_then(Value::as_str)
+                    .map(|s| s.len());
+                let auto_compressed = child_resp
+                    .get("result")
+                    .and_then(|r| r.get("_piggybank_compressed"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let result_bytes = post_compress_text.unwrap_or(0);
+                let compression_ratio = if auto_compressed {
+                    match (pre_compress_text, post_compress_text) {
+                        (Some(orig), Some(comp)) if orig > 0 => {
+                            Some(comp as f64 / orig as f64)
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                // Extract server name from the tool name (best-effort: use child process command).
+                let server_name = "child".to_string();
+                state.harvester.log(HarvestEvent::ToolCall {
+                    ts: harvest::now(),
+                    session_id: state.harvester.session_id().to_string(),
+                    server: server_name,
+                    tool: tool_name.to_string(),
+                    result_bytes,
+                    auto_compressed,
+                    compression_ratio,
+                });
 
                 // Replace child's id with caller's id in the response.
                 if let Some(obj) = child_resp.as_object_mut() {
@@ -664,6 +711,7 @@ pub fn run_proxy(
     args: &[String],
     threshold: usize,
     store_dir: &Path,
+    harvester: Harvester,
 ) -> io::Result<()> {
     let mut child = spawn_child(command, args).map_err(|e| {
         io::Error::new(
@@ -683,6 +731,7 @@ pub fn run_proxy(
         store,
         session,
         threshold,
+        harvester,
     };
 
     let stdin = io::stdin();
@@ -727,10 +776,12 @@ pub fn run_proxy(
 /// Parse proxy subcommand args and invoke run_proxy.
 ///
 /// Expected format:
-///   [--threshold <bytes>] [--store-dir <path>] -- <command> [args...]
+///   [--threshold <bytes>] [--store-dir <path>] [--harvest <path>] [--harvest-url <url>] -- <command> [args...]
 pub fn run_proxy_from_args(all_args: &[String]) -> io::Result<()> {
     let mut threshold = DEFAULT_THRESHOLD;
     let mut store_dir: Option<String> = None;
+    let mut harvest_path: Option<String> = None;
+    let mut harvest_url: Option<String> = None;
 
     // Find the `--` separator.
     let sep_pos = all_args.iter().position(|a| a == "--").ok_or_else(|| {
@@ -769,6 +820,22 @@ pub fn run_proxy_from_args(all_args: &[String]) -> io::Result<()> {
                     })?
                     .clone());
             }
+            "--harvest" => {
+                i += 1;
+                harvest_path = Some(proxy_args.get(i)
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidInput, "--harvest requires a file path")
+                    })?
+                    .clone());
+            }
+            "--harvest-url" => {
+                i += 1;
+                harvest_url = Some(proxy_args.get(i)
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidInput, "--harvest-url requires a URL")
+                    })?
+                    .clone());
+            }
             other => {
                 eprintln!("piggybank-proxy: unknown option '{other}', ignoring");
             }
@@ -784,10 +851,18 @@ pub fn run_proxy_from_args(all_args: &[String]) -> io::Result<()> {
         })
         .unwrap_or_else(|| ".piggybank-store".to_string());
 
+    let harvester = if let Some(url) = harvest_url {
+        Harvester::new_http(&url)
+    } else if let Some(path) = harvest_path {
+        Harvester::new_file(Path::new(&path))?
+    } else {
+        Harvester::new_null()
+    };
+
     let command = &child_argv[0];
     let args = &child_argv[1..];
 
-    run_proxy(command, args, threshold, Path::new(&store_dir))
+    run_proxy(command, args, threshold, Path::new(&store_dir), harvester)
 }
 
 #[cfg(test)]

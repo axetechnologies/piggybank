@@ -1,12 +1,12 @@
 use serde::Serialize;
 use std::fs::OpenOptions;
 use std::io::{self, Write};
+use std::net::TcpStream;
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[cfg_attr(not(test), allow(dead_code))]
-fn now() -> u64 {
+pub fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -95,8 +95,19 @@ pub enum HarvestEvent {
     },
 }
 
+const HTTP_FLUSH_EVERY: usize = 10;
+
+enum Sink {
+    File(Box<dyn Write + Send>),
+    Http {
+        url: String,
+        buffer: Vec<Vec<u8>>,
+    },
+    Null,
+}
+
 pub struct Harvester {
-    sink: Mutex<Box<dyn Write + Send>>,
+    sink: Mutex<Sink>,
     session_id: String,
 }
 
@@ -107,42 +118,157 @@ impl Harvester {
             .append(true)
             .open(path)?;
         Ok(Self {
-            sink: Mutex::new(Box::new(file)),
+            sink: Mutex::new(Sink::File(Box::new(file))),
             session_id: generate_session_id(),
         })
     }
 
     pub fn new_http(url: &str) -> Self {
-        // TODO: POST buffered JSONL batch to `url` on flush/drop.
-        let _ = url;
-        let buf: Vec<u8> = Vec::new();
         Self {
-            sink: Mutex::new(Box::new(std::io::Cursor::new(buf))),
+            sink: Mutex::new(Sink::Http {
+                url: url.to_string(),
+                buffer: Vec::new(),
+            }),
             session_id: generate_session_id(),
         }
     }
 
     pub fn new_null() -> Self {
         Self {
-            sink: Mutex::new(Box::new(std::io::sink())),
+            sink: Mutex::new(Sink::Null),
             session_id: generate_session_id(),
         }
     }
 
     pub fn log(&self, event: HarvestEvent) {
-        let Ok(mut line) = serde_json::to_vec(&event) else {
+        let Ok(line) = serde_json::to_vec(&event) else {
             return;
         };
-        line.push(b'\n');
-        if let Ok(mut sink) = self.sink.lock() {
-            let _ = sink.write_all(&line);
-            let _ = sink.flush();
+        let Ok(mut sink) = self.sink.lock() else {
+            return;
+        };
+        match &mut *sink {
+            Sink::File(w) => {
+                let mut data = line;
+                data.push(b'\n');
+                let _ = w.write_all(&data);
+                let _ = w.flush();
+            }
+            Sink::Http { url, buffer } => {
+                buffer.push(line);
+                if buffer.len() >= HTTP_FLUSH_EVERY {
+                    let batch: Vec<Vec<u8>> = std::mem::take(buffer);
+                    let url_clone = url.clone();
+                    std::thread::spawn(move || {
+                        http_post_jsonl(&url_clone, &batch);
+                    });
+                }
+            }
+            Sink::Null => {}
         }
     }
 
     pub fn session_id(&self) -> &str {
         &self.session_id
     }
+
+    fn flush_http_buffer(sink: &mut Sink) {
+        if let Sink::Http { url, buffer } = sink {
+            if !buffer.is_empty() {
+                let batch: Vec<Vec<u8>> = std::mem::take(buffer);
+                let url_clone = url.clone();
+                std::thread::spawn(move || {
+                    http_post_jsonl(&url_clone, &batch);
+                });
+            }
+        }
+    }
+}
+
+impl Drop for Harvester {
+    fn drop(&mut self) {
+        if let Ok(mut sink) = self.sink.lock() {
+            Harvester::flush_http_buffer(&mut sink);
+        }
+    }
+}
+
+fn http_post_jsonl(url: &str, batch: &[Vec<u8>]) {
+    let body: Vec<u8> = batch.iter().flat_map(|line| {
+        let mut v = line.clone();
+        v.push(b'\n');
+        v
+    }).collect();
+
+    let auth_key = std::env::var("AXELROD_KEY").unwrap_or_default();
+
+    if let Err(e) = http_post(url, &body, &auth_key) {
+        eprintln!("piggybank harvest: HTTP POST failed ({url}): {e}");
+    }
+}
+
+fn http_post(url: &str, body: &[u8], auth_key: &str) -> io::Result<()> {
+    let (host, port, path) = parse_url(url)?;
+
+    let addr = format!("{host}:{port}");
+    let mut stream = TcpStream::connect(&addr)?;
+
+    let auth_header = if auth_key.is_empty() {
+        String::new()
+    } else {
+        format!("Authorization: Bearer {auth_key}\r\n")
+    };
+
+    let request = format!(
+        "POST {path} HTTP/1.1\r\n\
+         Host: {host}\r\n\
+         Content-Type: application/x-ndjson\r\n\
+         {auth_header}\
+         Content-Length: {len}\r\n\
+         Connection: close\r\n\
+         \r\n",
+        len = body.len()
+    );
+
+    stream.write_all(request.as_bytes())?;
+    stream.write_all(body)?;
+    stream.flush()?;
+
+    // Read response to confirm delivery; discard on error.
+    let mut resp = Vec::new();
+    let _ = std::io::Read::read_to_end(&mut stream, &mut resp);
+
+    Ok(())
+}
+
+fn parse_url(url: &str) -> io::Result<(String, u16, String)> {
+    let url = url.trim();
+    let (rest, default_port) = if let Some(r) = url.strip_prefix("https://") {
+        (r, 443u16)
+    } else if let Some(r) = url.strip_prefix("http://") {
+        (r, 80u16)
+    } else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unsupported URL scheme: {url}"),
+        ));
+    };
+
+    let (authority, path) = match rest.find('/') {
+        Some(pos) => (&rest[..pos], rest[pos..].to_string()),
+        None => (rest, "/".to_string()),
+    };
+
+    let (host, port) = if let Some(pos) = authority.rfind(':') {
+        let port: u16 = authority[pos + 1..].parse().map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "invalid port in URL")
+        })?;
+        (authority[..pos].to_string(), port)
+    } else {
+        (authority.to_string(), default_port)
+    };
+
+    Ok((host, port, path))
 }
 
 #[cfg(test)]

@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/piggybank-core", "crates/piggybank-cli"]
+members = ["crates/piggybank-core", "crates/piggybank-cli", "crates/axelrod-cli"]
 resolver = "2"
 
 # Size-tuned release profile. Deliberately keeps panic=unwind (the default)
