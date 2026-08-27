@@ -5,7 +5,7 @@ const path = require("path");
 const https = require("https");
 const os = require("os");
 
-const REPO = "memjar/piggybank";
+const REPO = "axetechnologies/piggybank";
 const BIN_DIR = path.join(__dirname, "..");
 const BIN_PATH = path.join(BIN_DIR, "piggybank");
 

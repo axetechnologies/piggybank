@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO="memjar/piggybank"
+REPO="axetechnologies/piggybank"
 INSTALL_DIR="${PIGGYBANK_DIR:-$HOME/.piggybank}"
 BIN_DIR="$INSTALL_DIR/bin"
 STORE_DIR="$INSTALL_DIR/store"

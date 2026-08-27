@@ -13,7 +13,7 @@ npx -y piggybank-mcp
 Or add to Claude Code as a skill:
 
 ```bash
-npx skills add memjar/piggybank -s piggybank -y
+npx skills add axetechnologies/piggybank -s piggybank -y
 ```
 
 Or configure manually in `~/.claude.json`:

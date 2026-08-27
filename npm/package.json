@@ -3,8 +3,8 @@
   "version": "0.1.0",
   "description": "Context compression MCP server for AI agents — every token saved is money back in the piggybank",
   "license": "MIT",
-  "repository": "memjar/piggybank",
-  "homepage": "https://github.com/memjar/piggybank",
+  "repository": "axetechnologies/piggybank",
+  "homepage": "https://github.com/axetechnologies/piggybank",
   "keywords": ["mcp", "claude", "compression", "ai", "agents", "context-window", "token-savings"],
   "bin": {
     "piggybank-mcp": "bin/cli.js"

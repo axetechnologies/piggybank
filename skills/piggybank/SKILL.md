@@ -7,7 +7,7 @@ description: >-
   want to measure token savings, or when the user mentions piggybank,
   compression, context budget, or token cost.
 metadata:
-  source: https://github.com/memjar/piggybank/tree/main/skills/piggybank
+  source: https://github.com/axetechnologies/piggybank/tree/main/skills/piggybank
 mcp:
   piggybank:
     command: npx
@@ -28,7 +28,7 @@ Piggybank runs as a stdio MCP server. If not already configured, add it:
 
 ```bash
 # One-line install (downloads binary + configures Claude Code):
-curl -sSL https://raw.githubusercontent.com/memjar/piggybank/main/install.sh | bash
+curl -sSL https://raw.githubusercontent.com/axetechnologies/piggybank/main/install.sh | bash
 
 # Or via npx (no install needed):
 # Add to ~/.claude.json under mcpServers:
