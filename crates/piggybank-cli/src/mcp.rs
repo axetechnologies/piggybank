@@ -469,6 +469,9 @@ fn handle_compress(state: &ServerState, args: &Value) -> Result<Value, String> {
     if let Ok(compressed) =
         piggybank_core::compress_json_with_store(content.as_bytes(), &state.store)
     {
+        if let Some(k) = key {
+            state.session.record_content_hash(k, content.as_bytes());
+        }
         let savings = record_and_savings(state, content.len(), compressed.len());
         return Ok(json!({
             "view": encode_view("json", &compressed),

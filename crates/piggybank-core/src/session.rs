@@ -1,5 +1,6 @@
 use crate::markers::{escape_lines, strip_pua, unescape_lines, PUA};
 use crate::Store;
+use sha2::Digest;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -374,6 +375,14 @@ impl Session {
             }
         }
         Ok(None)
+    }
+
+    pub fn record_content_hash(&self, key: &str, content: &[u8]) {
+        let hash = hex::encode(sha2::Sha256::digest(content));
+        self.last_seen
+            .borrow_mut()
+            .insert(key.to_string(), hash);
+        let _ = self.persist();
     }
 
     pub fn check_changed(&self, key: &str, hash: &str) -> Result<(bool, bool), &'static str> {
