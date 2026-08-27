@@ -31,12 +31,12 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }}
       - name: Package
         run: |
-          BIN=target/${{ matrix.target }}/release/boomerang
-          tar czf boomerang-${{ matrix.target }}.tar.gz -C $(dirname $BIN) $(basename $BIN)
+          BIN=target/${{ matrix.target }}/release/piggybank
+          tar czf piggybank-${{ matrix.target }}.tar.gz -C $(dirname $BIN) $(basename $BIN)
       - uses: actions/upload-artifact@v4
         with:
-          name: boomerang-${{ matrix.target }}
-          path: boomerang-${{ matrix.target }}.tar.gz
+          name: piggybank-${{ matrix.target }}
+          path: piggybank-${{ matrix.target }}.tar.gz
 
   release:
     needs: build
@@ -47,5 +47,5 @@ jobs:
           merge-multiple: true
       - uses: softprops/action-gh-release@v2
         with:
-          files: boomerang-*.tar.gz
+          files: piggybank-*.tar.gz
           generate_release_notes: true
