@@ -8,8 +8,8 @@
 //! Usage:
 //!   piggybank proxy [--threshold <bytes>] [--store-dir <path>] -- <command> [args...]
 
-use piggybank_core::harvest::{HarvestEvent, Harvester};
 use piggybank_core::harvest;
+use piggybank_core::harvest::{HarvestEvent, Harvester};
 use piggybank_core::{Session, Store, TextOptions};
 use serde_json::{json, Value};
 use std::io::{self, BufRead, BufReader, Write};
@@ -49,8 +49,8 @@ fn spawn_child(command: &str, args: &[String]) -> io::Result<Child> {
 }
 
 fn send_to_child(state: &mut ProxyState, msg: &Value) -> io::Result<()> {
-    let line = serde_json::to_string(msg)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let line =
+        serde_json::to_string(msg).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     writeln!(state.child_stdin, "{}", line)?;
     state.child_stdin.flush()
 }
@@ -327,14 +327,10 @@ fn handle_pb_tool(state: &ProxyState, canonical_name: &str, args: &Value) -> Res
                 .ok_or("missing 'view' argument")?;
             let (kind, body) = decode_view(view)?;
             let result = match kind {
-                "json" => {
-                    piggybank_core::verify_json_with_store(body.as_bytes(), &state.store)
-                        .map_err(|e| e.to_string())?
-                }
-                "text" => {
-                    piggybank_core::verify_text_with_store(&state.store, body.as_bytes())
-                        .map_err(|e| e.to_string())?
-                }
+                "json" => piggybank_core::verify_json_with_store(body.as_bytes(), &state.store)
+                    .map_err(|e| e.to_string())?,
+                "text" => piggybank_core::verify_text_with_store(&state.store, body.as_bytes())
+                    .map_err(|e| e.to_string())?,
                 "session" => state
                     .session
                     .verify(body.as_bytes())
@@ -383,10 +379,10 @@ fn handle_pb_tool(state: &ProxyState, canonical_name: &str, args: &Value) -> Res
                 .get("content")
                 .and_then(Value::as_str)
                 .ok_or("missing 'content' argument")?;
-            let max_bytes = args
-                .get("max_bytes")
-                .and_then(Value::as_u64)
-                .ok_or("missing or invalid 'max_bytes' argument")? as usize;
+            let max_bytes =
+                args.get("max_bytes")
+                    .and_then(Value::as_u64)
+                    .ok_or("missing or invalid 'max_bytes' argument")? as usize;
             if max_bytes == 0 {
                 return Err("max_bytes must be >= 1".into());
             }
@@ -651,9 +647,7 @@ fn handle_message(state: &mut ProxyState, msg: &Value) -> io::Result<Option<Valu
                 let result_bytes = post_compress_text.unwrap_or(0);
                 let compression_ratio = if auto_compressed {
                     match (pre_compress_text, post_compress_text) {
-                        (Some(orig), Some(comp)) if orig > 0 => {
-                            Some(comp as f64 / orig as f64)
-                        }
+                        (Some(orig), Some(comp)) if orig > 0 => Some(comp as f64 / orig as f64),
                         _ => None,
                     }
                 } else {
@@ -806,35 +800,57 @@ pub fn run_proxy_from_args(all_args: &[String]) -> io::Result<()> {
         match proxy_args[i].as_str() {
             "--threshold" => {
                 i += 1;
-                threshold = proxy_args.get(i)
+                threshold = proxy_args
+                    .get(i)
                     .and_then(|s| s.parse().ok())
                     .ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::InvalidInput, "--threshold requires a numeric value")
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "--threshold requires a numeric value",
+                        )
                     })?;
             }
             "--store-dir" => {
                 i += 1;
-                store_dir = Some(proxy_args.get(i)
-                    .ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::InvalidInput, "--store-dir requires a path")
-                    })?
-                    .clone());
+                store_dir = Some(
+                    proxy_args
+                        .get(i)
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "--store-dir requires a path",
+                            )
+                        })?
+                        .clone(),
+                );
             }
             "--harvest" => {
                 i += 1;
-                harvest_path = Some(proxy_args.get(i)
-                    .ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::InvalidInput, "--harvest requires a file path")
-                    })?
-                    .clone());
+                harvest_path = Some(
+                    proxy_args
+                        .get(i)
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "--harvest requires a file path",
+                            )
+                        })?
+                        .clone(),
+                );
             }
             "--harvest-url" => {
                 i += 1;
-                harvest_url = Some(proxy_args.get(i)
-                    .ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::InvalidInput, "--harvest-url requires a URL")
-                    })?
-                    .clone());
+                harvest_url = Some(
+                    proxy_args
+                        .get(i)
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "--harvest-url requires a URL",
+                            )
+                        })?
+                        .clone(),
+                );
             }
             other => {
                 eprintln!("piggybank-proxy: unknown option '{other}', ignoring");
@@ -894,9 +910,7 @@ mod tests {
 
     #[test]
     fn merge_tools_with_collision() {
-        let child_tools = vec![
-            json!({ "name": "compress", "description": "child compress" }),
-        ];
+        let child_tools = vec![json!({ "name": "compress", "description": "child compress" })];
         let merged = merge_tools(&child_tools);
         let names: Vec<&str> = merged
             .iter()
@@ -926,15 +940,17 @@ mod tests {
         // Direct name is taken by child
         assert_eq!(resolve_pb_tool("compress", &child_names), None);
         // Prefixed name routes to pb tool
-        assert_eq!(resolve_pb_tool("pb_compress", &child_names), Some("compress"));
+        assert_eq!(
+            resolve_pb_tool("pb_compress", &child_names),
+            Some("compress")
+        );
         // Other pb tools unaffected
         assert_eq!(resolve_pb_tool("stats", &child_names), Some("stats"));
     }
 
     #[test]
     fn maybe_compress_response_below_threshold() {
-        let dir = std::env::temp_dir()
-            .join(format!("pb-proxy-test-nc-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("pb-proxy-test-nc-{}", std::process::id()));
         let store = Store::open(&dir).unwrap();
         let session = Session::open(&dir).unwrap();
         // Use a fake child_stdin/stdout — we won't call child I/O in this test.
@@ -953,7 +969,7 @@ mod tests {
         // logic via a helper that accepts store + threshold directly.
         let threshold = 4096;
         let _ = (store, session, threshold); // used in the real function
-        // Since text is < threshold, response must be unchanged.
+                                             // Since text is < threshold, response must be unchanged.
         assert_eq!(
             response["result"]["content"][0]["text"].as_str(),
             Some(short_text)

@@ -26,8 +26,8 @@
 //!   only the delta. Designed for tailing logs or polling builds.
 //! - `stats` — entry count and total bytes held in the store.
 
-use piggybank_core::harvest::{HarvestEvent, Harvester};
 use piggybank_core::harvest;
+use piggybank_core::harvest::{HarvestEvent, Harvester};
 use piggybank_core::{Session, Store, TextOptions};
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
@@ -198,7 +198,12 @@ fn load_counter(v: &Value, key: &str) -> AtomicU64 {
     AtomicU64::new(v.get(key).and_then(|v| v.as_u64()).unwrap_or(0))
 }
 
-pub fn serve(store_dir: &str, gc_days: u64, harvest_path: Option<&str>, harvest_url: Option<&str>) -> io::Result<()> {
+pub fn serve(
+    store_dir: &str,
+    gc_days: u64,
+    harvest_path: Option<&str>,
+    harvest_url: Option<&str>,
+) -> io::Result<()> {
     let analytics_path = std::path::Path::new(store_dir).join(".piggybank-analytics.json");
     let saved: Value = std::fs::read(&analytics_path)
         .ok()

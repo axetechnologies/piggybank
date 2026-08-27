@@ -44,8 +44,7 @@ fn save_config(api_url: &str, api_key: &str) -> Result<(), String> {
         "api_url": api_url,
         "api_key": api_key,
     });
-    fs::write(&path, serde_json::to_string_pretty(&obj).unwrap())
-        .map_err(|e| e.to_string())?;
+    fs::write(&path, serde_json::to_string_pretty(&obj).unwrap()).map_err(|e| e.to_string())?;
     Ok(())
 }
 

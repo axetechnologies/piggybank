@@ -36,7 +36,9 @@ fn usage() {
     eprintln!("       piggybankmcp serve [--store-dir <path>] [--gc-days <N>]     # MCP server over stdio (auto-GC: default 7d, 0=off)");
     eprintln!("       piggybankgc <store-dir> --older-than-days <N> [--dry-run]   # delete content first seen more than N days ago");
     eprintln!("                                                                    # (explicit, human-invoked only - never exposed over MCP)");
-    eprintln!("       piggybank proxy [--threshold <bytes>] [--store-dir <path>] -- <cmd> [args...]");
+    eprintln!(
+        "       piggybank proxy [--threshold <bytes>] [--store-dir <path>] -- <cmd> [args...]"
+    );
     eprintln!("                                                                    # transparent MCP proxy with auto-compression");
 }
 
@@ -123,21 +125,23 @@ fn run_mcp_serve(args: &[String]) -> ExitCode {
 
     // --harvest enables file harvesting; the path defaults to {store_dir}/harvest.jsonl.
     // --harvest-url enables HTTP harvesting (mutually exclusive with --harvest; url wins).
-    let harvest_path: Option<String> = args
-        .iter()
-        .position(|a| a == "--harvest")
-        .map(|i| {
-            args.get(i + 1)
-                .cloned()
-                .unwrap_or_else(|| format!("{store_dir}/harvest.jsonl"))
-        });
+    let harvest_path: Option<String> = args.iter().position(|a| a == "--harvest").map(|i| {
+        args.get(i + 1)
+            .cloned()
+            .unwrap_or_else(|| format!("{store_dir}/harvest.jsonl"))
+    });
 
     let harvest_url: Option<String> = args
         .iter()
         .position(|a| a == "--harvest-url")
         .and_then(|i| args.get(i + 1).cloned());
 
-    match mcp::serve(&store_dir, gc_days, harvest_path.as_deref(), harvest_url.as_deref()) {
+    match mcp::serve(
+        &store_dir,
+        gc_days,
+        harvest_path.as_deref(),
+        harvest_url.as_deref(),
+    ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("mcp server error: {e}");

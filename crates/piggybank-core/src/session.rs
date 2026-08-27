@@ -379,9 +379,7 @@ impl Session {
 
     pub fn record_content_hash(&self, key: &str, content: &[u8]) {
         let hash = hex::encode(sha2::Sha256::digest(content));
-        self.last_seen
-            .borrow_mut()
-            .insert(key.to_string(), hash);
+        self.last_seen.borrow_mut().insert(key.to_string(), hash);
         let _ = self.persist();
     }
 
