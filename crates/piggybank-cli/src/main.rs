@@ -30,11 +30,11 @@ fn usage() {
     eprintln!(
         "usage: piggybank <compress|decompress> <file>                       # JSON, lossless"
     );
-    eprintln!("       piggybank<compress-log|decompress-log> <file> [store-dir]   # text/logs");
-    eprintln!("       piggybankcompress-session <key> <file> [store-dir]          # diff vs. last seen under <key>");
-    eprintln!("       piggybankdecompress-session <file> [store-dir]");
-    eprintln!("       piggybankmcp serve [--store-dir <path>] [--gc-days <N>]     # MCP server over stdio (auto-GC: default 7d, 0=off)");
-    eprintln!("       piggybankgc <store-dir> --older-than-days <N> [--dry-run]   # delete content first seen more than N days ago");
+    eprintln!("       piggybank <compress-log|decompress-log> <file> [store-dir]  # text/logs");
+    eprintln!("       piggybank compress-session <key> <file> [store-dir]        # diff vs. last seen under <key>");
+    eprintln!("       piggybank decompress-session <file> [store-dir]");
+    eprintln!("       piggybank mcp serve [--store-dir <path>] [--gc-days <N>]   # MCP server over stdio (auto-GC: default 7d, 0=off)");
+    eprintln!("       piggybank gc <store-dir> --older-than-days <N> [--dry-run] # delete content first seen more than N days ago");
     eprintln!("                                                                    # (explicit, human-invoked only - never exposed over MCP)");
     eprintln!("       piggybank proxy [--threshold <bytes>] [--store-dir <path>] -- <cmd> [args...]");
     eprintln!("                                                                    # transparent MCP proxy with auto-compression");
@@ -110,7 +110,7 @@ fn run_mcp_serve(args: &[String]) -> ExitCode {
         .or_else(|| {
             env::var("HOME")
                 .ok()
-                .map(|home| format!("{home}/.piggybank/store"))
+                .map(|home| format!("{home}/.axe/boomerang-store"))
         })
         .unwrap_or_else(|| ".piggybank-store".to_string());
 
