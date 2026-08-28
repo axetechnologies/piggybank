@@ -488,7 +488,7 @@ fn handle_compress(state: &ServerState, args: &Value) -> Result<Value, String> {
         if let Some(k) = key {
             state.session.record_content_hash(k, content.as_bytes());
         }
-        let ratio = if content.len() > 0 {
+        let ratio = if !content.is_empty() {
             compressed.len() as f64 / content.len() as f64
         } else {
             1.0
@@ -530,7 +530,7 @@ fn handle_compress(state: &ServerState, args: &Value) -> Result<Value, String> {
         ),
     };
 
-    let ratio = if content.len() > 0 {
+    let ratio = if !content.is_empty() {
         compressed.len() as f64 / content.len() as f64
     } else {
         1.0
