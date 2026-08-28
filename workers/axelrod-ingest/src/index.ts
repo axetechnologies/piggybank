@@ -1,8 +1,11 @@
 import { renderFrontend } from "./frontend";
+import { handleAuthRoute, readSession, type AuthEnv } from "./auth";
+import { verifyAxisToken } from "./axisToken";
 
-export interface Env {
+export interface Env extends AuthEnv {
   HARVEST: R2Bucket;
   INGEST_KEY: string;
+  TOKEN_SIGNING_SECRET: string;
 }
 
 const VALID_EVENTS = new Set([
@@ -28,14 +31,20 @@ export default {
       return json({ service: "axelrod", status: "ok" });
     }
 
-    // POST /ingest — original route, no auth refactor needed
+    // Auth routes (login/callback/logout/me)
+    if (pathname.startsWith("/auth/")) {
+      const r = await handleAuthRoute(request, env, url);
+      if (r) return r;
+    }
+
+    // POST /ingest — machine ingest, bearer-token only
     if (pathname === "/ingest" && request.method === "POST") {
       return handleIngest(request, env);
     }
 
-    // All /datasets/* routes require auth
+    // All /datasets/* routes require session OR bearer
     if (pathname === "/datasets" || pathname.startsWith("/datasets/")) {
-      const authErr = checkAuth(request, env);
+      const authErr = await checkAuth(request, env);
       if (authErr) return authErr;
       return handleDatasets(request, env, url);
     }
@@ -51,18 +60,45 @@ export default {
 
 // ── Auth ──────────────────────────────────────────────────────────────────────
 
-function checkAuth(request: Request, env: Env): Response | null {
+async function checkAuth(request: Request, env: Env): Promise<Response | null> {
   const auth = request.headers.get("Authorization") ?? "";
-  if (!auth.startsWith("Bearer ") || auth.slice(7) !== env.INGEST_KEY) {
-    return json({ error: "unauthorized" }, 401);
+  if (auth.startsWith("Bearer ")) {
+    const token = auth.slice(7);
+    if (token === env.INGEST_KEY) return null;
+    if (env.TOKEN_SIGNING_SECRET) {
+      const claims = await verifyAxisToken(token, env.TOKEN_SIGNING_SECRET);
+      if (claims) return null;
+    }
   }
-  return null;
+  const session = await readSession(request, env);
+  if (session) return null;
+  const wantsHtml = (request.headers.get("Accept") ?? "").includes("text/html");
+  if (wantsHtml) {
+    const returnTo = encodeURIComponent(new URL(request.url).pathname);
+    return new Response(null, {
+      status: 302,
+      headers: { Location: `/auth/login?return_to=${returnTo}` },
+    });
+  }
+  return json({ error: "unauthorized" }, 401);
+}
+
+async function checkBearer(request: Request, env: Env): Promise<Response | null> {
+  const auth = request.headers.get("Authorization") ?? "";
+  if (!auth.startsWith("Bearer ")) return json({ error: "unauthorized" }, 401);
+  const token = auth.slice(7);
+  if (token === env.INGEST_KEY) return null;
+  if (env.TOKEN_SIGNING_SECRET) {
+    const claims = await verifyAxisToken(token, env.TOKEN_SIGNING_SECRET);
+    if (claims) return null;
+  }
+  return json({ error: "unauthorized" }, 401);
 }
 
 // ── /ingest (existing) ────────────────────────────────────────────────────────
 
 async function handleIngest(request: Request, env: Env): Promise<Response> {
-  const authErr = checkAuth(request, env);
+  const authErr = await checkBearer(request, env);
   if (authErr) return authErr;
 
   let body: string;
