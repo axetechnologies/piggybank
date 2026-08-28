@@ -99,10 +99,7 @@ const HTTP_FLUSH_EVERY: usize = 10;
 
 enum Sink {
     File(Box<dyn Write + Send>),
-    Http {
-        url: String,
-        buffer: Vec<Vec<u8>>,
-    },
+    Http { url: String, buffer: Vec<Vec<u8>> },
     Null,
 }
 
@@ -113,10 +110,7 @@ pub struct Harvester {
 
 impl Harvester {
     pub fn new_file(path: &Path) -> io::Result<Self> {
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
         Ok(Self {
             sink: Mutex::new(Sink::File(Box::new(file))),
             session_id: generate_session_id(),
@@ -194,11 +188,14 @@ impl Drop for Harvester {
 }
 
 fn http_post_jsonl(url: &str, batch: &[Vec<u8>]) {
-    let body: Vec<u8> = batch.iter().flat_map(|line| {
-        let mut v = line.clone();
-        v.push(b'\n');
-        v
-    }).collect();
+    let body: Vec<u8> = batch
+        .iter()
+        .flat_map(|line| {
+            let mut v = line.clone();
+            v.push(b'\n');
+            v
+        })
+        .collect();
 
     let auth_key = std::env::var("AXELROD_KEY").unwrap_or_default();
 
@@ -260,9 +257,9 @@ fn parse_url(url: &str) -> io::Result<(String, u16, String)> {
     };
 
     let (host, port) = if let Some(pos) = authority.rfind(':') {
-        let port: u16 = authority[pos + 1..].parse().map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidInput, "invalid port in URL")
-        })?;
+        let port: u16 = authority[pos + 1..]
+            .parse()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid port in URL"))?;
         (authority[..pos].to_string(), port)
     } else {
         (authority.to_string(), default_port)
@@ -317,8 +314,10 @@ mod tests {
 
     #[test]
     fn file_harvester_writes_valid_jsonl() {
-        let path = std::env::temp_dir()
-            .join(format!("piggybank-harvest-test-{}.jsonl", std::process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "piggybank-harvest-test-{}.jsonl",
+            std::process::id()
+        ));
         {
             let h = Harvester::new_file(&path).unwrap();
             h.log(HarvestEvent::Compress {

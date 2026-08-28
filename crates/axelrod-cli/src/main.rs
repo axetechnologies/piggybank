@@ -44,8 +44,7 @@ fn save_config(api_url: &str, api_key: &str) -> Result<(), String> {
         "api_url": api_url,
         "api_key": api_key,
     });
-    fs::write(&path, serde_json::to_string_pretty(&obj).unwrap())
-        .map_err(|e| e.to_string())?;
+    fs::write(&path, serde_json::to_string_pretty(&obj).unwrap()).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -179,7 +178,7 @@ fn cmd_datasets(_args: &[String]) -> ExitCode {
         .unwrap_or(4)
         .max(4);
 
-    println!("{:<name_w$}  {:>10}  {}", "NAME", "ROWS", "UPDATED");
+    println!("{:<name_w$}  {:>10}  UPDATED", "NAME", "ROWS");
     println!("{}", "-".repeat(name_w + 24));
     for d in datasets {
         let name = d.get("name").and_then(|v| v.as_str()).unwrap_or("-");

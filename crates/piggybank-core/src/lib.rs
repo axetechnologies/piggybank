@@ -2,11 +2,11 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::PathBuf;
 
+pub mod harvest;
 mod json;
 mod markers;
 mod session;
 mod text;
-pub mod harvest;
 pub use json::{
     compress_json, compress_json_with_store, decompress_json, decompress_json_with_store,
     verify_json_with_store,
