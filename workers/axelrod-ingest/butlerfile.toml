@@ -1,0 +1,45 @@
+name = "axelrod-ingest"
+kind = "cloudflare-worker"
+
+[cloudflare]
+account_id = "9f3d0c5847a5deb0e83e7f169b7cffef"
+main = "src/index.ts"
+compatibility_date = "2024-09-23"
+
+[[cloudflare.r2_buckets]]
+binding = "HARVEST"
+bucket_name = "axelrod-harvest"
+
+[[cloudflare.routes]]
+pattern = "axelrod.network/*"
+zone_name = "axelrod.network"
+
+# Register axelrod-ingest on the AXE edge proxy so /api/* on
+# axelrod.network is served through butler-proxy (fleet-key gate + hot reload)
+# in front of the Worker.
+[proxy]
+hosts = ["axelrod.network"]
+match_path = "/api/"
+upstream = "https://axelrod-ingest.axetechnologies.workers.dev"
+websocket = false
+timeout_ms = 30000
+
+[[secrets]]
+name = "INGEST_KEY"
+from = "keyhub://axelrod/INGEST_KEY"
+
+[[secrets]]
+name = "TOKEN_SIGNING_SECRET"
+from = "keyhub://shared/TOKEN_SIGNING_SECRET"
+
+[[secrets]]
+name = "SESSION_SECRET"
+from = "keyhub://axelrod/SESSION_SECRET"
+
+[[secrets]]
+name = "AUTHGATE_CLIENT_ID"
+value = "axelrod-web"
+
+[[secrets]]
+name = "AUTHGATE_CLIENT_SECRET"
+from = "keyhub://axelrod/AUTHGATE_CLIENT_SECRET"
