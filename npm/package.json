@@ -1,6 +1,6 @@
 {
   "name": "piggybank-mcp",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Context compression MCP server for AI agents — every token saved is money back in the piggybank",
   "license": "MIT",
   "repository": "axetechnologies/piggybank",
