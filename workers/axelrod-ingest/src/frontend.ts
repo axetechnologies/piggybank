@@ -161,7 +161,7 @@ tr:last-child td{border-bottom:none}
     <button class="nav-link" onclick="navigate('/models')">Models</button>
   </div>
   <div class="nav-right" id="nav-auth">
-    <button class="btn btn-ghost btn-sm" onclick="showAuthModal()">Log in</button>
+    <button class="btn btn-ghost btn-sm" onclick="login()">Log in</button>
   </div>
 </nav>
 
@@ -172,7 +172,7 @@ tr:last-child td{border-bottom:none}
     <div class="hero">
       <h1>Private AI<br><span>Data Platform</span></h1>
       <p>Collect, organize, and serve training data for AI systems — on your infrastructure, under your control.</p>
-      <button class="btn btn-primary" style="font-size:16px;padding:10px 24px" onclick="showAuthModal()">Get Started</button>
+      <button class="btn btn-primary" style="font-size:16px;padding:10px 24px" onclick="login()">Get Started</button>
       <div class="feature-grid">
         <div class="feature-card">
           <div class="feature-icon">&#x1F4BE;</div>
@@ -277,92 +277,61 @@ tr:last-child td{border-bottom:none}
 
 </div>
 
-<!-- Auth modal -->
-<div class="modal-overlay" id="auth-modal">
-  <div class="modal">
-    <h3>Enter API Key</h3>
-    <p>Your key is stored locally in this browser only. It is sent as a Bearer token with every request.</p>
-    <input type="password" id="api-key-input" placeholder="axelrod_key_…" onkeydown="if(event.key==='Enter')saveKey()">
-    <div class="error-msg" id="key-error">Invalid key — server returned 401.</div>
-    <div class="modal-actions">
-      <button class="btn btn-ghost" onclick="closeModal()">Cancel</button>
-      <button class="btn btn-primary" onclick="saveKey()">Save &amp; continue</button>
-    </div>
-  </div>
-</div>
-
 <script>
 (function(){
 "use strict";
 
 // ── State ──────────────────────────────────────────────────────────────────
-var KEY_LS = 'axelrod_api_key';
 var _datasets = [];
 var _currentDataset = null;
 
-function getKey(){ return localStorage.getItem(KEY_LS) || ''; }
-function setKey(k){ localStorage.setItem(KEY_LS, k); }
-function clearKey(){ localStorage.removeItem(KEY_LS); }
-function isAuthed(){ return !!getKey(); }
+var _session = null;
+function isAuthed(){ return !!_session; }
+
+async function refreshSession(){
+  try {
+    var res = await fetch('/auth/me', {credentials:'same-origin'});
+    if(res.ok){ _session = await res.json(); }
+    else { _session = null; }
+  } catch(e){ _session = null; }
+  renderNav();
+  return _session;
+}
 
 // ── Fetch wrapper ──────────────────────────────────────────────────────────
 async function api(path){
-  var k = getKey();
-  var headers = k ? {Authorization:'Bearer '+k} : {};
-  var res = await fetch(path, {headers});
+  var res = await fetch(path, {credentials:'same-origin'});
   if(res.status===401){
-    clearKey();
+    _session = null;
     renderNav();
-    showAuthModal();
+    login();
     throw new Error('401');
   }
   if(!res.ok) throw new Error('HTTP '+res.status);
   return res.json();
 }
 
-// ── Auth modal ─────────────────────────────────────────────────────────────
-window.showAuthModal = function(){
-  document.getElementById('auth-modal').classList.add('open');
-  var inp = document.getElementById('api-key-input');
-  inp.value = getKey();
-  document.getElementById('key-error').style.display='none';
-  setTimeout(function(){ inp.focus(); }, 50);
+window.login = function(){
+  var here = currentPath();
+  window.location.href = '/auth/login?return_to=' + encodeURIComponent(here);
 };
-window.closeModal = function(){
-  document.getElementById('auth-modal').classList.remove('open');
+window.logout = function(){
+  window.location.href = '/auth/logout?return_to=/';
 };
-window.saveKey = async function(){
-  var k = document.getElementById('api-key-input').value.trim();
-  if(!k) return;
-  setKey(k);
-  // Quick validation: hit /datasets
-  try {
-    await api('/datasets');
-    document.getElementById('key-error').style.display='none';
-    closeModal();
-    renderNav();
-    // Re-navigate to current page to load data
-    navigate(currentPath());
-  } catch(e){
-    if(e.message==='401'){
-      document.getElementById('key-error').style.display='block';
-    }
-  }
-};
+window.closeModal = function(){};
+window.saveKey = function(){};
 
 function renderNav(){
   var el = document.getElementById('nav-auth');
+  if(!el) return;
   if(isAuthed()){
-    el.innerHTML='<span class="nav-auth">&#x2713; Authenticated</span><button class="btn btn-ghost btn-sm" onclick="logout()">Log out</button>';
+    var who = (_session && (_session.email || _session.name || _session.sub)) || 'signed in';
+    el.innerHTML='<span class="nav-auth">'+escapeHtml(who)+'</span><button class="btn btn-ghost btn-sm" onclick="logout()">Log out</button>';
   } else {
-    el.innerHTML='<button class="btn btn-ghost btn-sm" onclick="showAuthModal()">Log in</button>';
+    el.innerHTML='<button class="btn btn-ghost btn-sm" onclick="login()">Log in</button>';
   }
 }
-window.logout = function(){
-  clearKey();
-  renderNav();
-  navigate('/');
-};
+function escapeHtml(s){ return String(s).replace(/[&<>"']/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]; }); }
 
 // ── Router ─────────────────────────────────────────────────────────────────
 function currentPath(){ return window.location.pathname || '/'; }
@@ -388,14 +357,14 @@ function dispatch(path){
     document.getElementById('page-home').classList.add('active');
   } else if(path==='/datasets'){
     document.getElementById('page-datasets').classList.add('active');
-    if(isAuthed()) loadDatasets(); else showAuthModal();
+    if(isAuthed()) loadDatasets(); else login();
   } else if(path.startsWith('/datasets/')){
     var name = path.slice('/datasets/'.length).split('/')[0];
     document.getElementById('page-detail').classList.add('active');
-    if(isAuthed()) loadDetail(name); else showAuthModal();
+    if(isAuthed()) loadDetail(name); else login();
   } else if(path==='/storage'){
     document.getElementById('page-storage').classList.add('active');
-    if(isAuthed()) loadStorage(); else showAuthModal();
+    if(isAuthed()) loadStorage(); else login();
   } else if(path==='/models'){
     document.getElementById('page-models').classList.add('active');
   } else {
@@ -566,12 +535,8 @@ async function loadStats(name){
 window.downloadDataset = function(){
   var name = _currentDataset;
   if(!name) return;
-  var k = getKey();
-  // Build a hidden form or open fetch-blob approach
-  fetch('/datasets/'+encodeURIComponent(name)+'/download', {
-    headers: k ? {Authorization:'Bearer '+k} : {}
-  }).then(function(res){
-    if(res.status===401){ clearKey(); renderNav(); showAuthModal(); return; }
+  fetch('/datasets/'+encodeURIComponent(name)+'/download', {credentials:'same-origin'}).then(function(res){
+    if(res.status===401){ _session=null; renderNav(); login(); return; }
     return res.blob();
   }).then(function(blob){
     if(!blob) return;
@@ -613,8 +578,7 @@ async function loadStorage(){
 }
 
 // ── Boot ───────────────────────────────────────────────────────────────────
-renderNav();
-dispatch(currentPath());
+refreshSession().then(function(){ dispatch(currentPath()); });
 
 })();
 </script>
