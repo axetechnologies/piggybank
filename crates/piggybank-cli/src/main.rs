@@ -1,5 +1,6 @@
 mod mcp;
 mod proxy;
+mod statusline;
 
 use piggybank_core::{Session, Store, TextOptions};
 use std::env;
@@ -19,6 +20,7 @@ fn main() -> ExitCode {
         Some("mcp") if args.get(2).map(String::as_str) == Some("serve") => run_mcp_serve(&args),
         Some("gc") => run_gc(&args),
         Some("proxy") => run_proxy(&args),
+        Some("statusline") => statusline::run_statusline(&args),
         _ => {
             usage();
             ExitCode::FAILURE
@@ -39,6 +41,7 @@ fn usage() {
     eprintln!(
         "       piggybank proxy [--threshold <bytes>] [--store-dir <path>] -- <cmd> [args...]"
     );
+    eprintln!("       piggybank statusline [--store-dir <path>] [--plain]         # one-line savings summary (today + lifetime)");
     eprintln!("                                                                    # transparent MCP proxy with auto-compression");
 }
 
