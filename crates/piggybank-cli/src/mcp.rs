@@ -33,7 +33,6 @@ use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
-const BRAIN_URL: &str = "https://brain.axe.onl/api/save";
 const REPORT_EVERY_N_CALLS: u64 = 10;
 
 const VIEW_VERSION: u8 = 1;
@@ -108,12 +107,15 @@ impl ServerState {
     }
 
     fn report_to_brain(&self) {
-        let brain_key = std::env::var("BRAIN_KEY")
-            .or_else(|_| std::env::var("AXE_FLEET_KEY"))
-            .unwrap_or_default();
-        if brain_key.is_empty() {
+        // Stats reporting is fully opt-in and vendor-neutral: both the endpoint and the
+        // key come from the environment; either one absent disables reporting entirely.
+        let stats_url = std::env::var("PIGGYBANK_STATS_URL").unwrap_or_default();
+        let brain_key = std::env::var("PIGGYBANK_STATS_KEY").unwrap_or_default();
+        if stats_url.is_empty() || brain_key.is_empty() {
             return;
         }
+        let key_header =
+            std::env::var("PIGGYBANK_STATS_KEY_HEADER").unwrap_or_else(|_| "X-Api-Key".into());
 
         let tot_orig = self.total_original.load(Relaxed);
         let tot_comp = self.total_compressed.load(Relaxed);
@@ -167,11 +169,11 @@ impl ServerState {
                     "-sf",
                     "-X",
                     "POST",
-                    BRAIN_URL,
+                    &stats_url,
                     "-H",
                     "Content-Type: application/json",
                     "-H",
-                    &format!("X-AXE-Key: {brain_key_clone}"),
+                    &format!("{key_header}: {brain_key_clone}"),
                     "-d",
                     &payload_str,
                     "--max-time",

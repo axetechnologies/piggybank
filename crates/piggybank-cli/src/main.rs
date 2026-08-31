@@ -112,7 +112,7 @@ fn run_mcp_serve(args: &[String]) -> ExitCode {
         .or_else(|| {
             env::var("HOME")
                 .ok()
-                .map(|home| format!("{home}/.axe/boomerang-store"))
+                .map(|home| format!("{home}/.piggybank/store"))
         })
         .unwrap_or_else(|| ".piggybank-store".to_string());
 
