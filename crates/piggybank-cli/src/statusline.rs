@@ -1,9 +1,9 @@
 //! `piggybank statusline` — one line of felt savings for a shell prompt or agent statusline.
 //!
 //! Aggregates two sources living in the store directory:
-//!   - `.piggybank-analytics.json`  — lifetime totals recorded by the MCP server
-//!   - `hook-savings.jsonl`         — per-rewrite `{"d":"YYYY-MM-DD","saved":N,...}` lines
-//!                                    appended by the PostToolUse hook
+//! - `.piggybank-analytics.json` — lifetime totals recorded by the MCP server
+//! - `hook-savings.jsonl` — per-rewrite `{"d":"YYYY-MM-DD","saved":N,...}` lines
+//!   appended by the PostToolUse hook
 //!
 //! Token and dollar figures use the same byte-based heuristic as the MCP stats path;
 //! keep these constants in sync with `mcp.rs` until a real tokenizer lands.
