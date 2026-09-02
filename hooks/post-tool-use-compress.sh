@@ -94,7 +94,7 @@ saved=$((byte_count - ${#compressed}))
 printf '{"d":"%s","saved":%s,"tool":"%s"}\n' "$(date +%F)" "$saved" "$tool_name" \
     >> "$STORE_DIR/hook-savings.jsonl" 2>/dev/null || true
 
-header="[piggybank: ${byte_count} -> ${#compressed} bytes, saved ${saved}B. Full output stored; 'piggybank decompress-session' or the retrieve MCP tool restores it.]"
+header="[piggybank compressed: ${byte_count}->${#compressed}B, ref stored]"
 
 printf '%s' "$payload" | python3 -c "
 import json, sys

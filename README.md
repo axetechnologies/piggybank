@@ -10,7 +10,7 @@ Every token an agent sends to an LLM costs money. Piggybank saves those tokens â
 
 The project was originally called Boomerang ("compress and it comes back"). The rename reflects what matters: not the mechanism (reversible compression), but the outcome (measurable cost savings on every API call).
 
-> Wire-format markers (`BOOMERANG:ELIDE`, `__boomerang_table__`, etc.) are intentionally preserved for backward compatibility with existing compressed content.
+> Wire-format markers now use the `PIGGYBANK:` prefix (e.g. `PIGGYBANK:ELIDE`, `PIGGYBANK:DIFF`). Content compressed with the old `BOOMERANG:` prefix (from pre-rename builds) will need to be re-compressed.
 
 ## What it does
 

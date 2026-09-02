@@ -86,7 +86,7 @@ mod tests {
 
     #[test]
     fn a_line_that_looks_like_a_real_marker_round_trips() {
-        assert_round_trips("before\n\u{E000}BOOMERANG:ELIDE:5:deadbeef\u{E000}\nafter");
+        assert_round_trips("before\n\u{E000}PIGGYBANK:ELIDE:5:deadbeef\u{E000}\nafter");
     }
 
     #[test]

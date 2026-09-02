@@ -359,7 +359,7 @@ fn tool_defs() -> Value {
         },
         {
             "name": "retrieve",
-            "description": "Fetch the exact original bytes behind a reference id embedded in a compressed view (e.g. the id inside a BOOMERANG:ELIDE:... marker). Nothing compress writes to its store is ever discarded, so this always succeeds for a ref it actually returned. Response includes first_seen_unix - when this exact content first entered the store, by any caller, not just this one (null if written before provenance tracking existed).",
+            "description": "Fetch the exact original bytes behind a reference id embedded in a compressed view (e.g. the id inside a PIGGYBANK:ELIDE:... marker). Nothing compress writes to its store is ever discarded, so this always succeeds for a ref it actually returned. Response includes first_seen_unix - when this exact content first entered the store, by any caller, not just this one (null if written before provenance tracking existed).",
             "inputSchema": {
                 "type": "object",
                 "properties": {

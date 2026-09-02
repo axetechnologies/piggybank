@@ -3,7 +3,7 @@
 # PreCompact hook: inject piggybank marker-preservation guidance into the compaction prompt.
 #
 # Runs before Claude Code's auto-compaction. If PostToolUse compression was active during
-# this session, BOOMERANG markers in the transcript encode compressed tool outputs. This
+# this session, PIGGYBANK markers in the transcript encode compressed tool outputs. This
 # hook tells Claude to preserve those markers verbatim in its summary so content remains
 # retrievable after compaction.
 #
@@ -18,13 +18,13 @@ PIGGYBANK="${PIGGYBANK_BIN:-$HOME/.piggybank/bin/piggybank}"
 # Read the hook payload
 payload=$(cat)
 
-# Count BOOMERANG markers in the transcript to decide if guidance is needed
+# Count PIGGYBANK markers in the transcript to decide if guidance is needed
 transcript_path=$(printf '%s' "$payload" | python3 -c \
   "import sys,json; print(json.load(sys.stdin).get('transcript_path',''))" 2>/dev/null || echo "")
 
 marker_count=0
 if [ -n "$transcript_path" ] && [ -f "$transcript_path" ]; then
-    marker_count=$(grep -c "BOOMERANG:" "$transcript_path" 2>/dev/null || echo "0")
+    marker_count=$(grep -c "PIGGYBANK:" "$transcript_path" 2>/dev/null || echo "0")
 fi
 
 # Get lifetime savings from piggybank stats
@@ -49,7 +49,7 @@ fi
 
 # Build the custom_instructions payload
 if [ "$marker_count" -gt 0 ] || [ -n "$savings_note" ]; then
-    instructions="PIGGYBANK COMPRESSION ACTIVE: This conversation contains $marker_count compressed content references (BOOMERANG: markers). These markers are the ONLY handle for reconstructing large tool outputs. Rules: (1) Copy any BOOMERANG: marker VERBATIM into your summary — never paraphrase or omit them. (2) Record which tool call produced each marker so it can be correlated after compaction. (3) A marker like BOOMERANG:ELIDE:<hash> means a section was elided; 'piggybank retrieve <hash>' restores it. $savings_note"
+    instructions="PIGGYBANK COMPRESSION ACTIVE: This conversation contains $marker_count compressed content references (PIGGYBANK: markers). These markers are the ONLY handle for reconstructing large tool outputs. Rules: (1) Copy any PIGGYBANK: marker VERBATIM into your summary — never paraphrase or omit them. (2) Record which tool call produced each marker so it can be correlated after compaction. (3) A marker like PIGGYBANK:ELIDE:<hash> means a section was elided; 'piggybank retrieve <hash>' restores it. $savings_note"
 else
     # No compression activity — pass through with no modification
     exit 0

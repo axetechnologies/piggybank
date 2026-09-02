@@ -52,7 +52,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CORPUS_DIR = REPO_ROOT / "benchmarks" / "corpus"
-BOOMERANG_BIN = REPO_ROOT / "target" / "debug" / "boomerang"
+PIGGYBANK_BIN = REPO_ROOT / "target" / "debug" / "piggybank"
 HEADROOM_PYTHON = Path.home() / ".local" / "pipx" / "venvs" / "headroom-ai" / "bin" / "python"
 
 import tiktoken  # noqa: E402
@@ -138,7 +138,7 @@ def run_boomerang(path: Path) -> dict:
     is_json = path.suffix == ".json"
     subcmd = "compress" if is_json else "compress-log"
     store_dir = REPO_ROOT / "benchmarks" / ".bench-store"
-    args = [str(BOOMERANG_BIN), subcmd, str(path)]
+    args = [str(PIGGYBANK_BIN), subcmd, str(path)]
     if not is_json:
         args.append(str(store_dir))
 
@@ -150,9 +150,9 @@ def run_boomerang(path: Path) -> dict:
     compressed_text = proc.stdout
 
     decompress_args = (
-        [str(BOOMERANG_BIN), "decompress", "/dev/stdin"]
+        [str(PIGGYBANK_BIN), "decompress", "/dev/stdin"]
         if is_json
-        else [str(BOOMERANG_BIN), "decompress-log", "/dev/stdin", str(store_dir)]
+        else [str(PIGGYBANK_BIN), "decompress-log", "/dev/stdin", str(store_dir)]
     )
     decompress_proc = subprocess.run(
         decompress_args, input=compressed_text, capture_output=True, text=True, timeout=60
@@ -169,8 +169,8 @@ def run_boomerang(path: Path) -> dict:
 
 
 def main() -> None:
-    if not BOOMERANG_BIN.exists():
-        sys.exit(f"boomerang binary not found at {BOOMERANG_BIN} - run `cargo build -p boomerang-cli` first")
+    if not PIGGYBANK_BIN.exists():
+        sys.exit(f"boomerang binary not found at {PIGGYBANK_BIN} - run `cargo build -p piggybank-cli` first")
     if not HEADROOM_PYTHON.exists():
         sys.exit(f"headroom-ai venv python not found at {HEADROOM_PYTHON}")
 
