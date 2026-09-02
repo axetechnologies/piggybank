@@ -1,0 +1,21 @@
+{
+  "name": "piggybank",
+  "description": "Lossless context compression for AI agents. Deduplicates repeated tool output across a session, elides large first-sight Bash output behind a retrievable reference, and tracks token/dollar savings — every compressed reference decompresses back to the exact original bytes.",
+  "version": "1.0.0",
+  "author": {
+    "name": "AXE Technologies",
+    "url": "https://github.com/axetechnologies"
+  },
+  "homepage": "https://github.com/axetechnologies/piggybank",
+  "repository": "https://github.com/axetechnologies/piggybank",
+  "license": "MIT",
+  "keywords": ["context-compression", "token-savings", "mcp", "cost-optimization"],
+  "mcpServers": {
+    "piggybank": {
+      "command": "npx",
+      "args": ["-y", "piggybank-mcp"],
+      "type": "stdio"
+    }
+  },
+  "hooks": "./hooks/hooks.json"
+}

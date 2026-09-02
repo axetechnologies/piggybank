@@ -1,0 +1,34 @@
+{
+  "name": "piggybank",
+  "owner": {
+    "name": "AXE Technologies",
+    "url": "https://github.com/axetechnologies"
+  },
+  "metadata": {
+    "description": "Marketplace for Piggybank — lossless context compression for AI agents.",
+    "version": "1.0.0"
+  },
+  "plugins": [
+    {
+      "name": "piggybank",
+      "source": "./",
+      "description": "Compresses large tool outputs before they hit the context window — deduplicates repeated reads/commands, tracks token/dollar savings, and every compressed reference decompresses back to the exact original bytes.",
+      "version": "1.0.0",
+      "author": {
+        "name": "AXE Technologies",
+        "url": "https://github.com/axetechnologies"
+      },
+      "homepage": "https://github.com/axetechnologies/piggybank",
+      "license": "MIT",
+      "keywords": [
+        "context-compression",
+        "token-savings",
+        "mcp",
+        "hooks",
+        "cost-optimization"
+      ],
+      "mcpServers": "./skills/piggybank/SKILL.md",
+      "hooks": "./hooks/hooks.json"
+    }
+  ]
+}
