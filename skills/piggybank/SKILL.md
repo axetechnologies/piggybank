@@ -60,7 +60,7 @@ Compress content to fit within a specific token budget. Specify max tokens and p
 Incrementally compress new content against an existing compressed session. Only the diff is stored — ideal for streaming or multi-turn conversations.
 
 ### `retrieve`
-Fetch the exact original bytes behind a reference ID embedded in a compressed view (e.g. `BOOMERANG:ELIDE:...` markers). Always succeeds for any ref piggybank returned.
+Fetch the exact original bytes behind a reference ID embedded in a compressed view (e.g. `PIGGYBANK:ELIDE:...` markers). Always succeeds for any ref piggybank returned.
 
 ### `stats`
 Show compression statistics: total bytes in, bytes out, savings percentage, dollar cost saved, number of sessions.
@@ -93,4 +93,4 @@ These rules apply regardless of which AI tool is running (Claude Code, Cursor, C
 
 ## Wire Format
 
-Compressed output uses inline markers like `BOOMERANG:ELIDE:<ref-id>` for elided sections. These are stable, permanent references into the local store. The `retrieve` tool resolves any marker back to its original content.
+Compressed output uses inline markers like `PIGGYBANK:ELIDE:<ref-id>` for elided sections. These are stable, permanent references into the local store. The `retrieve` tool resolves any marker back to its original content.

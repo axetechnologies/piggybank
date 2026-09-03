@@ -226,14 +226,14 @@ impl Session {
             return Ok(compressed.to_vec());
         };
 
-        if let Some(id) = strip_pua(text, "BOOMERANG:UNCHANGED:") {
+        if let Some(id) = strip_pua(text, "PIGGYBANK:UNCHANGED:") {
             // Store content is always raw/unescaped - nothing to undo.
             return self.store.get(id);
         }
 
         if let Some((first, rest)) = text.split_once('\n') {
             if let Some(prev_id) =
-                strip_pua(first, "BOOMERANG:DIFF:").or_else(|| strip_pua(first, "BOOMERANG:CREF:"))
+                strip_pua(first, "PIGGYBANK:DIFF:").or_else(|| strip_pua(first, "PIGGYBANK:CREF:"))
             {
                 let old_text = utf8(self.store.get(prev_id)?)?;
                 let old_escaped = escape_lines(&old_text);
@@ -258,11 +258,11 @@ impl Session {
         let Ok(text) = std::str::from_utf8(compressed) else {
             return Ok(result.finish());
         };
-        if let Some(id) = strip_pua(text, "BOOMERANG:UNCHANGED:") {
+        if let Some(id) = strip_pua(text, "PIGGYBANK:UNCHANGED:") {
             result.check(&self.store, id)?;
         } else if let Some((first, _rest)) = text.split_once('\n') {
             if let Some(ref_id) =
-                strip_pua(first, "BOOMERANG:DIFF:").or_else(|| strip_pua(first, "BOOMERANG:CREF:"))
+                strip_pua(first, "PIGGYBANK:DIFF:").or_else(|| strip_pua(first, "PIGGYBANK:CREF:"))
             {
                 result.check(&self.store, ref_id)?;
             }
@@ -410,15 +410,15 @@ fn utf8(bytes: Vec<u8>) -> io::Result<String> {
 }
 
 fn unchanged_marker(id: &str) -> String {
-    format!("{PUA}BOOMERANG:UNCHANGED:{id}{PUA}")
+    format!("{PUA}PIGGYBANK:UNCHANGED:{id}{PUA}")
 }
 
 fn diff_marker(id: &str) -> String {
-    format!("{PUA}BOOMERANG:DIFF:{id}{PUA}")
+    format!("{PUA}PIGGYBANK:DIFF:{id}{PUA}")
 }
 
 fn cref_marker(id: &str) -> String {
-    format!("{PUA}BOOMERANG:CREF:{id}{PUA}")
+    format!("{PUA}PIGGYBANK:CREF:{id}{PUA}")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -518,10 +518,10 @@ fn format_diff(ops: &[DiffOp]) -> String {
     let mut out: Vec<String> = Vec::new();
     for op in ops {
         match op {
-            DiffOp::Same(n) => out.push(format!("{PUA}BOOMERANG:SAME:{n}{PUA}")),
-            DiffOp::Delete(n) => out.push(format!("{PUA}BOOMERANG:DELETE:{n}{PUA}")),
+            DiffOp::Same(n) => out.push(format!("{PUA}PIGGYBANK:SAME:{n}{PUA}")),
+            DiffOp::Delete(n) => out.push(format!("{PUA}PIGGYBANK:DELETE:{n}{PUA}")),
             DiffOp::Insert(lines) => {
-                out.push(format!("{PUA}BOOMERANG:INSERT:{}{PUA}", lines.len()));
+                out.push(format!("{PUA}PIGGYBANK:INSERT:{}{PUA}", lines.len()));
                 out.extend(lines.iter().cloned());
             }
         }
@@ -535,14 +535,14 @@ fn parse_diff(text: &str) -> Option<Vec<DiffOp>> {
     let mut idx = 0;
     while idx < lines.len() {
         let line = lines[idx];
-        if let Some(n) = strip_pua(line, "BOOMERANG:SAME:").and_then(|s| s.parse().ok()) {
+        if let Some(n) = strip_pua(line, "PIGGYBANK:SAME:").and_then(|s| s.parse().ok()) {
             ops.push(DiffOp::Same(n));
             idx += 1;
-        } else if let Some(n) = strip_pua(line, "BOOMERANG:DELETE:").and_then(|s| s.parse().ok()) {
+        } else if let Some(n) = strip_pua(line, "PIGGYBANK:DELETE:").and_then(|s| s.parse().ok()) {
             ops.push(DiffOp::Delete(n));
             idx += 1;
         } else {
-            let n = strip_pua(line, "BOOMERANG:INSERT:").and_then(|s| s.parse::<usize>().ok())?;
+            let n = strip_pua(line, "PIGGYBANK:INSERT:").and_then(|s| s.parse::<usize>().ok())?;
             idx += 1;
             if idx + n > lines.len() {
                 return None;
@@ -690,7 +690,7 @@ mod tests {
             .unwrap();
         let compressed_str = String::from_utf8(compressed.clone()).unwrap();
         assert!(
-            compressed_str.contains("BOOMERANG:CREF:"),
+            compressed_str.contains("PIGGYBANK:CREF:"),
             "similar content under a new key should produce a CREF diff"
         );
         assert!(
@@ -718,7 +718,7 @@ mod tests {
         let compressed = session.compress("b.txt", unrelated).unwrap();
         let compressed_str = String::from_utf8(compressed.clone()).unwrap();
         assert!(
-            !compressed_str.contains("BOOMERANG:CREF:"),
+            !compressed_str.contains("PIGGYBANK:CREF:"),
             "unrelated content should not produce a CREF diff"
         );
     }
@@ -729,7 +729,7 @@ mod tests {
         // content that happens to look like one of our own markers must
         // not be misinterpreted the next time it's decompressed.
         let session = Session::new(temp_store());
-        let content = format!("real line\n{PUA}BOOMERANG:UNCHANGED:deadbeef{PUA}\nanother line");
+        let content = format!("real line\n{PUA}PIGGYBANK:UNCHANGED:deadbeef{PUA}\nanother line");
         let compressed = session.compress("weird.txt", content.as_bytes()).unwrap();
         let restored = session.decompress(&compressed).unwrap();
         assert_eq!(restored, content.into_bytes());
@@ -748,8 +748,8 @@ mod tests {
         session.compress("f.txt", old.as_bytes()).unwrap();
 
         let mut new_lines: Vec<String> = (0..20).map(|i| format!("line {i}")).collect();
-        new_lines.insert(10, format!("{PUA}BOOMERANG:SAME:99{PUA}"));
-        new_lines.insert(15, format!("{PUA}BOOMERANG:DELETE:99{PUA}"));
+        new_lines.insert(10, format!("{PUA}PIGGYBANK:SAME:99{PUA}"));
+        new_lines.insert(15, format!("{PUA}PIGGYBANK:DELETE:99{PUA}"));
         let new = new_lines.join("\n");
 
         let compressed = session.compress("f.txt", new.as_bytes()).unwrap();
@@ -782,7 +782,7 @@ mod tests {
         assert!(
             strip_pua(
                 compressed_text.lines().next().unwrap_or(""),
-                "BOOMERANG:DIFF:"
+                "PIGGYBANK:DIFF:"
             )
             .is_none(),
             "must not have attempted a diff above the cell cap"
@@ -899,7 +899,7 @@ mod tests {
     #[test]
     fn append_escapes_marker_looking_content() {
         let session = Session::new(temp_store());
-        let tricky = format!("{PUA}BOOMERANG:UNCHANGED:deadbeef{PUA}");
+        let tricky = format!("{PUA}PIGGYBANK:UNCHANGED:deadbeef{PUA}");
         let view = session.append("f.log", tricky.as_bytes()).unwrap();
         // The returned view must be escaped so it won't be misinterpreted.
         assert_ne!(
@@ -988,10 +988,10 @@ mod tests {
         fn arb_line() -> impl Strategy<Value = String> {
             prop_oneof![
                 4 => "[a-zA-Z0-9 ]{0,15}",
-                1 => Just(format!("{PUA}BOOMERANG:UNCHANGED:deadbeefdeadbeefdeadbeefdeadbeefdeadbeef{PUA}")),
-                1 => Just(format!("{PUA}BOOMERANG:DIFF:deadbeefdeadbeefdeadbeefdeadbeefdeadbeef{PUA}")),
-                1 => Just(format!("{PUA}BOOMERANG:CREF:deadbeefdeadbeefdeadbeefdeadbeefdeadbeef{PUA}")),
-                1 => Just(format!("{PUA}BOOMERANG:SAME:3{PUA}")),
+                1 => Just(format!("{PUA}PIGGYBANK:UNCHANGED:deadbeefdeadbeefdeadbeefdeadbeefdeadbeef{PUA}")),
+                1 => Just(format!("{PUA}PIGGYBANK:DIFF:deadbeefdeadbeefdeadbeefdeadbeefdeadbeef{PUA}")),
+                1 => Just(format!("{PUA}PIGGYBANK:CREF:deadbeefdeadbeefdeadbeefdeadbeefdeadbeef{PUA}")),
+                1 => Just(format!("{PUA}PIGGYBANK:SAME:3{PUA}")),
             ]
         }
 

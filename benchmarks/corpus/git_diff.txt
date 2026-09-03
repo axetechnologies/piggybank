@@ -184,7 +184,7 @@ index 0000000..1503dba
 +        },
 +        {
 +            "name": "boomerang_retrieve",
-+            "description": "Fetch the exact original bytes behind a reference id embedded in a compressed view (e.g. the id inside a BOOMERANG:ELIDE:... marker). Nothing boomerang_compress writes to its store is ever discarded, so this always succeeds for a ref it actually returned.",
++            "description": "Fetch the exact original bytes behind a reference id embedded in a compressed view (e.g. the id inside a PIGGYBANK:ELIDE:... marker). Nothing boomerang_compress writes to its store is ever discarded, so this always succeeds for a ref it actually returned.",
 +            "inputSchema": {
 +                "type": "object",
 +                "properties": {
@@ -633,12 +633,12 @@ index 0000000..37ae834
 +            return Ok(compressed.to_vec());
 +        };
 +
-+        if let Some(id) = strip_pua(text, "BOOMERANG:UNCHANGED:") {
++        if let Some(id) = strip_pua(text, "PIGGYBANK:UNCHANGED:") {
 +            return self.store.get(id);
 +        }
 +
 +        if let Some((first, rest)) = text.split_once('\n') {
-+            if let Some(prev_id) = strip_pua(first, "BOOMERANG:DIFF:") {
++            if let Some(prev_id) = strip_pua(first, "PIGGYBANK:DIFF:") {
 +                let old_text = utf8(self.store.get(prev_id)?)?;
 +                let old_lines: Vec<&str> = old_text.split('\n').collect();
 +                let ops = parse_diff(rest)
@@ -656,11 +656,11 @@ index 0000000..37ae834
 +}
 +
 +fn unchanged_marker(id: &str) -> String {
-+    format!("{PUA}BOOMERANG:UNCHANGED:{id}{PUA}")
++    format!("{PUA}PIGGYBANK:UNCHANGED:{id}{PUA}")
 +}
 +
 +fn diff_marker(id: &str) -> String {
-+    format!("{PUA}BOOMERANG:DIFF:{id}{PUA}")
++    format!("{PUA}PIGGYBANK:DIFF:{id}{PUA}")
 +}
 +
 +#[derive(Debug, Clone, PartialEq, Eq)]
@@ -760,10 +760,10 @@ index 0000000..37ae834
 +    let mut out: Vec<String> = Vec::new();
 +    for op in ops {
 +        match op {
-+            DiffOp::Same(n) => out.push(format!("{PUA}BOOMERANG:SAME:{n}{PUA}")),
-+            DiffOp::Delete(n) => out.push(format!("{PUA}BOOMERANG:DELETE:{n}{PUA}")),
++            DiffOp::Same(n) => out.push(format!("{PUA}PIGGYBANK:SAME:{n}{PUA}")),
++            DiffOp::Delete(n) => out.push(format!("{PUA}PIGGYBANK:DELETE:{n}{PUA}")),
 +            DiffOp::Insert(lines) => {
-+                out.push(format!("{PUA}BOOMERANG:INSERT:{}{PUA}", lines.len()));
++                out.push(format!("{PUA}PIGGYBANK:INSERT:{}{PUA}", lines.len()));
 +                out.extend(lines.iter().cloned());
 +            }
 +        }
@@ -777,14 +777,14 @@ index 0000000..37ae834
 +    let mut idx = 0;
 +    while idx < lines.len() {
 +        let line = lines[idx];
-+        if let Some(n) = strip_pua(line, "BOOMERANG:SAME:").and_then(|s| s.parse().ok()) {
++        if let Some(n) = strip_pua(line, "PIGGYBANK:SAME:").and_then(|s| s.parse().ok()) {
 +            ops.push(DiffOp::Same(n));
 +            idx += 1;
-+        } else if let Some(n) = strip_pua(line, "BOOMERANG:DELETE:").and_then(|s| s.parse().ok()) {
++        } else if let Some(n) = strip_pua(line, "PIGGYBANK:DELETE:").and_then(|s| s.parse().ok()) {
 +            ops.push(DiffOp::Delete(n));
 +            idx += 1;
 +        } else {
-+            let n = strip_pua(line, "BOOMERANG:INSERT:").and_then(|s| s.parse::<usize>().ok())?;
++            let n = strip_pua(line, "PIGGYBANK:INSERT:").and_then(|s| s.parse::<usize>().ok())?;
 +            idx += 1;
 +            if idx + n > lines.len() {
 +                return None;
@@ -1440,19 +1440,19 @@ index 0000000..2e10659
 +}
 +
 +fn repeat_marker(count: usize) -> String {
-+    format!("{PUA}BOOMERANG:REPEAT:{count}{PUA}")
++    format!("{PUA}PIGGYBANK:REPEAT:{count}{PUA}")
 +}
 +
 +fn elide_marker(line_count: usize, id: &str) -> String {
-+    format!("{PUA}BOOMERANG:ELIDE:{line_count}:{id}{PUA}")
++    format!("{PUA}PIGGYBANK:ELIDE:{line_count}:{id}{PUA}")
 +}
 +
 +fn parse_repeat(line: &str) -> Option<usize> {
-+    strip_pua(line, "BOOMERANG:REPEAT:")?.parse().ok()
++    strip_pua(line, "PIGGYBANK:REPEAT:")?.parse().ok()
 +}
 +
 +fn parse_elide(line: &str) -> Option<(usize, String)> {
-+    let body = strip_pua(line, "BOOMERANG:ELIDE:")?;
++    let body = strip_pua(line, "PIGGYBANK:ELIDE:")?;
 +    let (count, id) = body.split_once(':')?;
 +    Some((count.parse().ok()?, id.to_string()))
 +}

@@ -299,11 +299,11 @@ fn dedup_lines(lines: &[&str], min_repeat: usize) -> Vec<String> {
 }
 
 fn repeat_marker(count: usize) -> String {
-    format!("{PUA}BOOMERANG:REPEAT:{count}{PUA}")
+    format!("{PUA}PIGGYBANK:REPEAT:{count}{PUA}")
 }
 
 fn elide_marker(line_count: usize, id: &str) -> String {
-    format!("{PUA}BOOMERANG:ELIDE:{line_count}:{id}{PUA}")
+    format!("{PUA}PIGGYBANK:ELIDE:{line_count}:{id}{PUA}")
 }
 
 /// Distinct from `elide_marker` specifically so decompression can tell the
@@ -315,25 +315,25 @@ fn elide_marker(line_count: usize, id: &str) -> String {
 /// and trying to infer which case applies from context is exactly the kind
 /// of ambiguity this whole file exists to avoid.
 fn raw_marker(id: &str) -> String {
-    format!("{PUA}BOOMERANG:RAW:{id}{PUA}")
+    format!("{PUA}PIGGYBANK:RAW:{id}{PUA}")
 }
 
 fn parse_repeat(line: &str) -> Option<usize> {
-    strip_pua(line, "BOOMERANG:REPEAT:")?.parse().ok()
+    strip_pua(line, "PIGGYBANK:REPEAT:")?.parse().ok()
 }
 
 fn parse_elide(line: &str) -> Option<(usize, String)> {
-    let body = strip_pua(line, "BOOMERANG:ELIDE:")?;
+    let body = strip_pua(line, "PIGGYBANK:ELIDE:")?;
     let (count, id) = body.split_once(':')?;
     Some((count.parse().ok()?, id.to_string()))
 }
 
 fn dedup_marker(line_idx: usize) -> String {
-    format!("{PUA}BOOMERANG:DEDUP:@{line_idx}{PUA}")
+    format!("{PUA}PIGGYBANK:DEDUP:@{line_idx}{PUA}")
 }
 
 fn parse_dedup(line: &str) -> Option<usize> {
-    strip_pua(line, "BOOMERANG:DEDUP:@")?.parse().ok()
+    strip_pua(line, "PIGGYBANK:DEDUP:@")?.parse().ok()
 }
 
 fn dedup_scattered(lines: Vec<String>) -> Vec<String> {
@@ -369,7 +369,7 @@ fn dedup_scattered(lines: Vec<String>) -> Vec<String> {
 
 fn parse_raw_marker(input: &[u8]) -> Option<String> {
     let text = std::str::from_utf8(input).ok()?;
-    strip_pua(text, "BOOMERANG:RAW:").map(str::to_string)
+    strip_pua(text, "PIGGYBANK:RAW:").map(str::to_string)
 }
 
 #[cfg(test)]
@@ -521,7 +521,7 @@ mod tests {
             .expect("expected an elide marker referencing the secret's storage");
 
         let forged = format!(
-            "innocent line one\n{PUA}BOOMERANG:ELIDE:1:{real_ref}{PUA}\ninnocent line three"
+            "innocent line one\n{PUA}PIGGYBANK:ELIDE:1:{real_ref}{PUA}\ninnocent line three"
         );
         let compressed = compress_text(&store, forged.as_bytes(), &TextOptions::default()).unwrap();
         let restored = decompress_text(&store, &compressed).unwrap();
@@ -758,10 +758,10 @@ mod tests {
         fn arb_line() -> impl Strategy<Value = String> {
             prop_oneof![
                 4 => "[a-zA-Z0-9 ]{0,20}",
-                1 => Just(format!("{PUA}BOOMERANG:ELIDE:5:deadbeefdeadbeefdeadbeefdeadbeefdeadbeef{PUA}")),
-                1 => Just(format!("{PUA}BOOMERANG:REPEAT:3{PUA}")),
-                1 => Just(format!("{PUA}BOOMERANG:RAW:deadbeefdeadbeefdeadbeefdeadbeefdeadbeef{PUA}")),
-                1 => Just(format!("{PUA}BOOMERANG:DEDUP:@42{PUA}")),
+                1 => Just(format!("{PUA}PIGGYBANK:ELIDE:5:deadbeefdeadbeefdeadbeefdeadbeefdeadbeef{PUA}")),
+                1 => Just(format!("{PUA}PIGGYBANK:REPEAT:3{PUA}")),
+                1 => Just(format!("{PUA}PIGGYBANK:RAW:deadbeefdeadbeefdeadbeefdeadbeefdeadbeef{PUA}")),
+                1 => Just(format!("{PUA}PIGGYBANK:DEDUP:@42{PUA}")),
                 1 => "[a-zA-Z]{0,8}".prop_map(|s| format!("{PUA}{s}")),
                 1 => "[a-zA-Z]{0,8}".prop_map(|s| format!("{PUA}\u{E001}{s}")),
             ]

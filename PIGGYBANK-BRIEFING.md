@@ -36,7 +36,7 @@ Enterprise verification completed 2026-08-27. 72 tool calls, ~13 minutes of auto
 ### Results
 
 - **98/98 unit tests pass** (including proptest fuzzing for arbitrary JSON/text)
-- **Round-trip fidelity**: all content types pass — small JSON, large JSON (600 items), unicode/emoji/CJK, mixed line endings, binary content, empty input, adversarial BOOMERANG markers
+- **Round-trip fidelity**: all content types pass — small JSON, large JSON (600 items), unicode/emoji/CJK, mixed line endings, binary content, empty input, adversarial PIGGYBANK markers
 - **MCP protocol compliance**: all 8 tools return spec-compliant responses, error handling uses `isError: true`, path traversal rejected at store level
 - **Proxy**: starts clean, merges tool lists (16 tools — 8 original + 8 `pb_` prefixed), passes tool calls through correctly
 - **Performance**: <2ms for <3KB, <5ms for <10KB, ~17ms for 30KB
