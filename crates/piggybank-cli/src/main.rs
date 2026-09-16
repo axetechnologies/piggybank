@@ -11,6 +11,10 @@ use std::process::ExitCode;
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
     match args.get(1).map(String::as_str) {
+        Some("--version") | Some("-V") => {
+            println!("piggybank {}", env!("CARGO_PKG_VERSION"));
+            ExitCode::SUCCESS
+        }
         Some("compress") => run_json(&args, piggybank_core::compress_json),
         Some("decompress") => run_json(&args, piggybank_core::decompress_json),
         Some("compress-log") => run_text(&args, true),
@@ -19,7 +23,7 @@ fn main() -> ExitCode {
         Some("decompress-session") => run_session_decompress(&args),
         Some("mcp") if args.get(2).map(String::as_str) == Some("serve") => run_mcp_serve(&args),
         Some("gc") => run_gc(&args),
-        Some("proxy") => run_proxy(&args),
+        Some("proxy") => run_proxy_cmd(&args),
         Some("statusline") => statusline::run_statusline(&args),
         _ => {
             usage();
@@ -39,13 +43,13 @@ fn usage() {
     eprintln!("       piggybank gc <store-dir> --older-than-days <N> [--dry-run] # delete content first seen more than N days ago");
     eprintln!("                                                                    # (explicit, human-invoked only - never exposed over MCP)");
     eprintln!(
-        "       piggybank proxy [--threshold <bytes>] [--store-dir <path>] -- <cmd> [args...]"
+        "       piggybank proxy [--threshold <bytes>] [--store-dir <path>] [--stats-file <path>]"
     );
+    eprintln!("                       [--stats] [--full-tools] -- <cmd> [args...]  # transparent MCP proxy with auto-compression");
     eprintln!("       piggybank statusline [--store-dir <path>] [--plain]         # one-line savings summary (today + lifetime)");
-    eprintln!("                                                                    # transparent MCP proxy with auto-compression");
 }
 
-fn run_proxy(args: &[String]) -> ExitCode {
+fn run_proxy_cmd(args: &[String]) -> ExitCode {
     // args[0] is "piggybank", args[1] is "proxy"; pass everything from args[2] onward.
     let proxy_args: Vec<String> = args[2..].to_vec();
     match proxy::run_proxy_from_args(&proxy_args) {

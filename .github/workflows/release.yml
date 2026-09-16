@@ -6,37 +6,75 @@ on:
 
 permissions:
   contents: write
+  id-token: write  # required for npm --provenance
 
 jobs:
   build:
     strategy:
+      fail-fast: false
       matrix:
         include:
           - target: aarch64-apple-darwin
             os: macos-14
+            ext: ""
+            archive: tar.gz
           - target: x86_64-apple-darwin
             os: macos-14
+            ext: ""
+            archive: tar.gz
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
+            ext: ""
+            archive: tar.gz
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            ext: ""
+            archive: tar.gz
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            ext: ".exe"
+            archive: zip
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      - name: Install musl tools
-        if: contains(matrix.target, 'musl')
-        run: sudo apt-get install -y musl-tools
+
+      - name: Install musl tools (Linux musl targets)
+        if: contains(matrix.target, 'musl') && runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y musl-tools gcc-aarch64-linux-gnu
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
-      - name: Package
+
+      - name: Package (Unix)
+        if: matrix.archive == 'tar.gz'
         run: |
           BIN=target/${{ matrix.target }}/release/piggybank
-          tar czf piggybank-${{ matrix.target }}.tar.gz -C $(dirname $BIN) $(basename $BIN)
+          ASSET=piggybank-${{ matrix.target }}.tar.gz
+          tar czf "$ASSET" -C "$(dirname "$BIN")" "$(basename "$BIN")"
+          sha256sum "$ASSET" > "$ASSET.sha256"
+
+      - name: Package (Windows)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $BIN = "target/${{ matrix.target }}/release/piggybank.exe"
+          $ASSET = "piggybank-${{ matrix.target }}.zip"
+          Compress-Archive -Path $BIN -DestinationPath $ASSET
+          $hash = (Get-FileHash $ASSET -Algorithm SHA256).Hash.ToLower()
+          "$hash  $ASSET" | Out-File -FilePath "$ASSET.sha256" -Encoding ascii
+
       - uses: actions/upload-artifact@v4
         with:
           name: piggybank-${{ matrix.target }}
-          path: piggybank-${{ matrix.target }}.tar.gz
+          path: |
+            piggybank-${{ matrix.target }}.*
 
   release:
     needs: build
@@ -45,7 +83,41 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           merge-multiple: true
+
+      - name: List assets
+        run: ls -la
+
       - uses: softprops/action-gh-release@v2
         with:
-          files: piggybank-*.tar.gz
+          files: |
+            piggybank-*.tar.gz
+            piggybank-*.zip
+            piggybank-*.sha256
           generate_release_notes: true
+
+  publish-npm:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Verify npm version matches tag
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          NPM_VER="$(node -p "require('./npm/package.json').version")"
+          if [ "$TAG" != "$NPM_VER" ]; then
+            echo "ERROR: tag v$TAG does not match npm/package.json version $NPM_VER"
+            exit 1
+          fi
+          echo "Version check passed: $NPM_VER"
+
+      - name: Publish to npm
+        working-directory: npm
+        run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

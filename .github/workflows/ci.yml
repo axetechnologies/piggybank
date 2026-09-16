@@ -21,3 +21,23 @@ jobs:
         run: cargo test --workspace
       - name: build release
         run: cargo build --workspace --release
+
+  version-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Check npm and Cargo versions match
+        run: |
+          CARGO_VER="$(grep '^version' crates/piggybank-cli/Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')"
+          NPM_VER="$(node -p "require('./npm/package.json').version")"
+          echo "Cargo version: $CARGO_VER"
+          echo "npm version:   $NPM_VER"
+          if [ "$CARGO_VER" != "$NPM_VER" ]; then
+            echo "ERROR: Cargo crate version ($CARGO_VER) does not match npm/package.json ($NPM_VER)"
+            echo "Update both before merging."
+            exit 1
+          fi
+          echo "Versions match: $CARGO_VER"
