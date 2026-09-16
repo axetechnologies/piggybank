@@ -91,7 +91,11 @@ fn extract_from_message(
                 if content.len() >= opts.min_bytes {
                     let sha = store.put(content.as_bytes())?;
                     let preview = make_preview(&content);
-                    entries.push(LedgerEntry { sha, tool_name, preview });
+                    entries.push(LedgerEntry {
+                        sha,
+                        tool_name,
+                        preview,
+                    });
                 }
                 return Ok(());
             }
@@ -108,7 +112,11 @@ fn extract_from_message(
                 if content.len() >= opts.min_bytes {
                     let sha = store.put(content.as_bytes())?;
                     let preview = make_preview(&content);
-                    entries.push(LedgerEntry { sha, tool_name, preview });
+                    entries.push(LedgerEntry {
+                        sha,
+                        tool_name,
+                        preview,
+                    });
                 }
                 return Ok(());
             }
@@ -146,18 +154,17 @@ fn extract_content_str(val: Option<&Value>) -> String {
     match val {
         None => String::new(),
         Some(Value::String(s)) => s.clone(),
-        Some(Value::Array(arr)) => {
-            arr.iter()
-                .filter_map(|item| {
-                    if item.get("type").and_then(|t| t.as_str()) == Some("text") {
-                        item.get("text").and_then(|t| t.as_str()).map(String::from)
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        }
+        Some(Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|item| {
+                if item.get("type").and_then(|t| t.as_str()) == Some("text") {
+                    item.get("text").and_then(|t| t.as_str()).map(String::from)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
         Some(other) => serde_json::to_string(other).unwrap_or_default(),
     }
 }
@@ -198,10 +205,7 @@ fn response_to_text(val: &Value) -> String {
 fn make_preview(content: &str) -> String {
     let first: String = content.chars().take(80).collect();
     // Collapse whitespace/newlines into spaces for readability
-    first
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+    first.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Format ledger entries as the BOOMERANG:CREF index string.
@@ -255,7 +259,10 @@ mod tests {
             r#"{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"tu_1","tool_name":"Bash","content":"{content}"}}]}}"#,
         );
         let path = write_transcript(&tmpdir, &[&line]);
-        let opts = LedgerOptions { min_bytes: 100, ..Default::default() };
+        let opts = LedgerOptions {
+            min_bytes: 100,
+            ..Default::default()
+        };
         let entries = build_ledger(&path, &store, &opts).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].tool_name, "Bash");
@@ -270,7 +277,10 @@ mod tests {
             r#"{{"role":"user","content":[{{"type":"tool_result","tool_name":"Read","content":"{content}"}}]}}"#,
         );
         let path = write_transcript(&tmpdir, &[&line]);
-        let opts = LedgerOptions { min_bytes: 2048, ..Default::default() };
+        let opts = LedgerOptions {
+            min_bytes: 2048,
+            ..Default::default()
+        };
         let entries = build_ledger(&path, &store, &opts).unwrap();
         assert_eq!(entries.len(), 0);
     }
@@ -289,7 +299,10 @@ mod tests {
         })
         .to_string();
         let path = write_transcript(&tmpdir, &[&line]);
-        let opts = LedgerOptions { min_bytes: 100, ..Default::default() };
+        let opts = LedgerOptions {
+            min_bytes: 100,
+            ..Default::default()
+        };
         let entries = build_ledger(&path, &store, &opts).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].tool_name, "WebFetch");
@@ -306,7 +319,10 @@ mod tests {
             r#"{{"role":"user","content":[{{"type":"tool_result","tool_name":"Read","content":"{long}"}}]}}"#,
         );
         let path = write_transcript(&tmpdir, &[&line1, &line2]);
-        let opts = LedgerOptions { min_bytes: 100, ..Default::default() };
+        let opts = LedgerOptions {
+            min_bytes: 100,
+            ..Default::default()
+        };
         let entries = build_ledger(&path, &store, &opts).unwrap();
         assert_eq!(entries.len(), 2);
     }
@@ -320,7 +336,11 @@ mod tests {
                 preview: "preview text".to_string(),
             })
             .collect();
-        let opts = LedgerOptions { max_lines: 40, max_index_bytes: 100_000, ..Default::default() };
+        let opts = LedgerOptions {
+            max_lines: 40,
+            max_index_bytes: 100_000,
+            ..Default::default()
+        };
         let index = format_index(&entries, &opts);
         let count = index.lines().count();
         assert!(count <= 40, "expected <= 40 lines, got {count}");
@@ -335,9 +355,17 @@ mod tests {
                 preview: "x".repeat(80),
             })
             .collect();
-        let opts = LedgerOptions { max_lines: 40, max_index_bytes: 300, ..Default::default() };
+        let opts = LedgerOptions {
+            max_lines: 40,
+            max_index_bytes: 300,
+            ..Default::default()
+        };
         let index = format_index(&entries, &opts);
-        assert!(index.len() <= 300 + 200, "index too large: {} bytes", index.len());
+        assert!(
+            index.len() <= 300 + 200,
+            "index too large: {} bytes",
+            index.len()
+        );
     }
 
     #[test]

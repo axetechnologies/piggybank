@@ -37,7 +37,9 @@ fn main() -> ExitCode {
 
 fn run_ledger(args: &[String]) -> ExitCode {
     let Some(transcript_path) = args.get(2) else {
-        eprintln!("usage: piggybank ledger <transcript.jsonl> [--store-dir <path>] [--min-bytes <N>]");
+        eprintln!(
+            "usage: piggybank ledger <transcript.jsonl> [--store-dir <path>] [--min-bytes <N>]"
+        );
         return ExitCode::FAILURE;
     };
     let store_dir = args

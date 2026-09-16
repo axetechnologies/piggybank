@@ -41,7 +41,12 @@ impl InitOptions {
             .position(|a| a == "--hooks-src")
             .and_then(|i| args.get(i + 1))
             .map(PathBuf::from);
-        InitOptions { dry_run, uninstall, store_dir, hooks_src }
+        InitOptions {
+            dry_run,
+            uninstall,
+            store_dir,
+            hooks_src,
+        }
     }
 }
 
@@ -119,7 +124,14 @@ pub fn run_init(args: &[String]) -> std::process::ExitCode {
     if changed.is_empty() {
         println!("piggybank init: nothing to do (already configured)");
     } else {
-        println!("piggybank init: {}", if opts.dry_run { "would change" } else { "changed" });
+        println!(
+            "piggybank init: {}",
+            if opts.dry_run {
+                "would change"
+            } else {
+                "changed"
+            }
+        );
         for c in &changed {
             println!("  {c}");
         }
@@ -155,7 +167,10 @@ fn run_uninstall(
             if let Ok(mut val) = serde_json::from_str::<Value>(&text) {
                 if let Some(servers) = val.get_mut("mcpServers").and_then(|v| v.as_object_mut()) {
                     if servers.remove("piggybank").is_some() {
-                        changed.push(format!("removed mcpServers.piggybank from {}", claude_json.display()));
+                        changed.push(format!(
+                            "removed mcpServers.piggybank from {}",
+                            claude_json.display()
+                        ));
                         if !opts.dry_run {
                             let _ = backup_file(claude_json);
                             let _ = write_json(claude_json, &val);
@@ -189,7 +204,10 @@ fn run_uninstall(
                         });
                         if hooks_arr.len() < before {
                             modified = true;
-                            changed.push(format!("removed piggybank {event} hook from {}", settings_json.display()));
+                            changed.push(format!(
+                                "removed piggybank {event} hook from {}",
+                                settings_json.display()
+                            ));
                         }
                     }
                 }
@@ -205,7 +223,14 @@ fn run_uninstall(
         println!("piggybank uninstall: nothing to remove");
     } else {
         for c in &changed {
-            println!("{}", if opts.dry_run { format!("would: {c}") } else { c.clone() });
+            println!(
+                "{}",
+                if opts.dry_run {
+                    format!("would: {c}")
+                } else {
+                    c.clone()
+                }
+            );
         }
     }
     std::process::ExitCode::SUCCESS
@@ -348,7 +373,10 @@ fn merge_settings_json(
         });
         if !already {
             post_arr.push(desired_entry);
-            changed.push(format!("added PostToolUse piggybank hook to {}", path.display()));
+            changed.push(format!(
+                "added PostToolUse piggybank hook to {}",
+                path.display()
+            ));
         }
     }
 
@@ -373,11 +401,18 @@ fn merge_settings_json(
         });
         if !already {
             pre_arr.push(desired_entry);
-            changed.push(format!("added PreCompact piggybank hook to {}", path.display()));
+            changed.push(format!(
+                "added PreCompact piggybank hook to {}",
+                path.display()
+            ));
         }
     }
 
-    if changed.iter().any(|c| c.contains(path.to_str().unwrap_or(""))) && !opts.dry_run {
+    if changed
+        .iter()
+        .any(|c| c.contains(path.to_str().unwrap_or("")))
+        && !opts.dry_run
+    {
         if path.parent().is_some() {
             fs::create_dir_all(path.parent().unwrap())?;
         }
@@ -397,9 +432,8 @@ fn backup_file(path: &Path) -> std::io::Result<()> {
 }
 
 fn write_json(path: &Path, val: &Value) -> std::io::Result<()> {
-    let text = serde_json::to_string_pretty(val).map_err(|e| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-    })?;
+    let text = serde_json::to_string_pretty(val)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     fs::write(path, text + "\n")
 }
 
