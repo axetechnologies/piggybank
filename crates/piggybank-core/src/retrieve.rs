@@ -109,9 +109,7 @@ fn select_lines(lines: &[&str], opts: &RetrieveOpts) -> Vec<usize> {
 
     // Grep filter.
     if let Some(ref pattern) = opts.grep {
-        let mut matched: Vec<usize> = (0..n)
-            .filter(|&i| glob_match(pattern, lines[i]))
-            .collect();
+        let mut matched: Vec<usize> = (0..n).filter(|&i| glob_match(pattern, lines[i])).collect();
 
         if opts.context > 0 {
             let mut with_ctx: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();

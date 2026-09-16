@@ -342,7 +342,11 @@ fn compress_git_diff(store: &Store, text: &str) -> std::io::Result<Vec<u8>> {
                 if let Some(marker) = store_and_elide(store, middle)? {
                     out.push(marker);
                 }
-                out.extend(ctx_buf[ctx_buf.len() - KEEP_CTX..].iter().map(|s| s.to_string()));
+                out.extend(
+                    ctx_buf[ctx_buf.len() - KEEP_CTX..]
+                        .iter()
+                        .map(|s| s.to_string()),
+                );
             }
             ctx_buf.clear();
         };
@@ -421,10 +425,7 @@ fn compress_jsonl(store: &Store, text: &str) -> std::io::Result<Vec<u8>> {
         .iter()
         .find(|l| !l.trim().is_empty())
         .and_then(|l| serde_json::from_str::<serde_json::Value>(l.trim()).ok())
-        .and_then(|v| {
-            v.as_object()
-                .map(|o| o.keys().cloned().collect::<Vec<_>>())
-        });
+        .and_then(|v| v.as_object().map(|o| o.keys().cloned().collect::<Vec<_>>()));
 
     let Some(keys) = schema_keys else {
         return Ok(text.as_bytes().to_vec());
@@ -571,8 +572,7 @@ mod tests {
             .filter(|l| l.starts_with("   Compiling "))
             .count();
         if compiling_count > 2 {
-            let compressed =
-                compress_with_format(&store, input.as_bytes(), Format::Cargo).unwrap();
+            let compressed = compress_with_format(&store, input.as_bytes(), Format::Cargo).unwrap();
             let compressed_text = String::from_utf8(compressed).unwrap();
             let compressed_compiling = compressed_text.matches("   Compiling ").count();
             assert!(

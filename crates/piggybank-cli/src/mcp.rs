@@ -493,10 +493,7 @@ fn parse_format_hint(hint: Option<&str>) -> Option<piggybank_core::Format> {
     }
 }
 
-fn detect_or_hint_format(
-    content: &str,
-    hint: Option<&str>,
-) -> Option<piggybank_core::Format> {
+fn detect_or_hint_format(content: &str, hint: Option<&str>) -> Option<piggybank_core::Format> {
     parse_format_hint(hint).or_else(|| piggybank_core::detect_format(content))
 }
 
@@ -690,13 +687,13 @@ fn handle_retrieve(state: &ServerState, args: &Value) -> Result<Value, String> {
     // Parse optional slice params.
     let lines_range = args.get("lines").and_then(Value::as_str).and_then(|s| {
         let (a, b) = s.split_once('-')?;
-        Some((a.trim().parse::<usize>().ok()?, b.trim().parse::<usize>().ok()?))
+        Some((
+            a.trim().parse::<usize>().ok()?,
+            b.trim().parse::<usize>().ok()?,
+        ))
     });
     let grep = args.get("grep").and_then(Value::as_str).map(str::to_string);
-    let context = args
-        .get("context")
-        .and_then(Value::as_u64)
-        .unwrap_or(0) as usize;
+    let context = args.get("context").and_then(Value::as_u64).unwrap_or(0) as usize;
     let head = args.get("head").and_then(Value::as_u64).map(|n| n as usize);
     let tail = args.get("tail").and_then(Value::as_u64).map(|n| n as usize);
     let max_bytes = args
@@ -764,8 +761,8 @@ fn handle_compress_budget(state: &ServerState, args: &Value) -> Result<Value, St
     if normal_would_exceed && within_budget {
         state.budget_enforcements.fetch_add(1, Relaxed);
     }
-    let fmt_detected = detect_or_hint_format(content, format_hint)
-        .map(|f| format!("{f:?}").to_ascii_lowercase());
+    let fmt_detected =
+        detect_or_hint_format(content, format_hint).map(|f| format!("{f:?}").to_ascii_lowercase());
     let savings = record_and_savings(state, content.len(), compressed.len());
     Ok(json!({
         "view": encode_view("text", &compressed),
