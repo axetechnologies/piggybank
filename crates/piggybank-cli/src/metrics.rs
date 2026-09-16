@@ -159,7 +159,7 @@ impl MetricsStore {
         };
 
         let mut tools_vec: Vec<(&String, &ToolEntry)> = g.tools.iter().collect();
-        tools_vec.sort_by(|a, b| b.1.compressions.cmp(&a.1.compressions));
+        tools_vec.sort_by_key(|a| std::cmp::Reverse(a.1.compressions));
         let by_tool: Vec<Value> = tools_vec
             .iter()
             .take(20)
@@ -177,7 +177,7 @@ impl MetricsStore {
             .collect();
 
         let mut keys_vec: Vec<(&String, &KeyEntry)> = g.keys.iter().collect();
-        keys_vec.sort_by(|a, b| b.1.compressions.cmp(&a.1.compressions));
+        keys_vec.sort_by_key(|a| std::cmp::Reverse(a.1.compressions));
         let by_key: Vec<Value> = keys_vec
             .iter()
             .take(20)
