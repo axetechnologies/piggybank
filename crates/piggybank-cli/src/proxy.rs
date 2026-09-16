@@ -7,17 +7,27 @@
 //!
 //! Usage:
 //!   piggybank proxy [--threshold <bytes>] [--store-dir <path>] -- <command> [args...]
+//!
+//! Environment variables:
+//!   PIGGYBANK_PROXY_FULL_TOOLS=1  Pass tools/list through unmodified (no description trimming).
+//!   PIGGYBANK_MIN_BYTES=N         Override the compression threshold (same as --threshold).
+//!   PIGGYBANK_SKIP_TOOLS=a,b,c    Comma-separated tool names whose responses are never compressed.
 
 use piggybank_core::harvest;
 use piggybank_core::harvest::{HarvestEvent, Harvester};
 use piggybank_core::{Session, Store, TextOptions};
 use serde_json::{json, Value};
+use std::collections::{HashMap, HashSet};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 const DEFAULT_THRESHOLD: usize = 4096;
 const VIEW_VERSION: u8 = 1;
+/// Maximum bytes kept for each tool description when trimming tools/list.
+const TOOL_DESC_CAP: usize = 200;
+/// Maximum bytes kept for the entire inputSchema block when trimming.
+const SCHEMA_CAP: usize = 300;
 
 fn encode_view(kind: &str, compressed: &[u8]) -> String {
     format!(
@@ -28,15 +38,50 @@ fn encode_view(kind: &str, compressed: &[u8]) -> String {
     )
 }
 
+/// Per-tool compression statistics accumulated during the proxy session.
+#[derive(Default, Clone)]
+pub struct ToolStats {
+    pub calls: u64,
+    pub original_bytes: u64,
+    pub compressed_bytes: u64,
+    pub compressed_calls: u64,
+}
+
+impl ToolStats {
+    fn savings_bytes(&self) -> u64 {
+        self.original_bytes.saturating_sub(self.compressed_bytes)
+    }
+
+    fn ratio(&self) -> f64 {
+        if self.original_bytes == 0 {
+            1.0
+        } else {
+            self.compressed_bytes as f64 / self.original_bytes as f64
+        }
+    }
+}
+
+/// Whether the child process uses newline-delimited or Content-Length framing.
+#[derive(Clone, Copy)]
+enum Framing {
+    Newline,
+    ContentLength,
+}
+
 struct ProxyState {
     child_stdin: ChildStdin,
     child_stdout: BufReader<ChildStdout>,
+    child_framing: Framing,
     child_tools: Vec<Value>,
     next_child_id: u64,
     store: Store,
     session: Session,
     threshold: usize,
     harvester: Harvester,
+    skip_tools: HashSet<String>,
+    per_tool_stats: HashMap<String, ToolStats>,
+    full_tools: bool,
+    server_name: String,
 }
 
 fn spawn_child(command: &str, args: &[String]) -> io::Result<Child> {
@@ -49,29 +94,132 @@ fn spawn_child(command: &str, args: &[String]) -> io::Result<Child> {
 }
 
 fn send_to_child(state: &mut ProxyState, msg: &Value) -> io::Result<()> {
-    let line =
+    let body =
         serde_json::to_string(msg).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    writeln!(state.child_stdin, "{}", line)?;
-    state.child_stdin.flush()
+    match state.child_framing {
+        Framing::Newline => {
+            writeln!(state.child_stdin, "{}", body)?;
+            state.child_stdin.flush()
+        }
+        Framing::ContentLength => {
+            let header = format!("Content-Length: {}\r\n\r\n", body.len());
+            state.child_stdin.write_all(header.as_bytes())?;
+            state.child_stdin.write_all(body.as_bytes())?;
+            state.child_stdin.flush()
+        }
+    }
 }
 
+/// Read one JSON-RPC message from the child, supporting both newline-delimited
+/// and Content-Length framing. Transparently auto-detects framing from the
+/// first response. Handles messages of any size including 10 MB+.
 fn read_from_child(state: &mut ProxyState) -> io::Result<Value> {
+    match state.child_framing {
+        Framing::ContentLength => read_content_length_frame(&mut state.child_stdout),
+        Framing::Newline => {
+            // Peek at first non-empty line.  If it looks like an HTTP-style
+            // header switch to Content-Length mode for this and future reads.
+            loop {
+                let mut line = String::new();
+                let n = state.child_stdout.read_line(&mut line)?;
+                if n == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "child process closed stdout",
+                    ));
+                }
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                // Detect Content-Length framing on the first substantive line.
+                if trimmed.to_ascii_lowercase().starts_with("content-length:") {
+                    state.child_framing = Framing::ContentLength;
+                    // The line we just read is the first header.  We need to
+                    // parse it together with the rest of the header block, then
+                    // read the body.
+                    return read_content_length_body(&mut state.child_stdout, trimmed);
+                }
+                return serde_json::from_str(trimmed)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e));
+            }
+        }
+    }
+}
+
+/// Read a full Content-Length frame from `reader`.
+/// Expects: one or more `Name: value\r\n` headers, then `\r\n`, then body.
+fn read_content_length_frame<R: BufRead>(reader: &mut R) -> io::Result<Value> {
+    let mut content_length: Option<usize> = None;
     loop {
-        let mut line = String::new();
-        let n = state.child_stdout.read_line(&mut line)?;
+        let mut header = String::new();
+        let n = reader.read_line(&mut header)?;
         if n == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
-                "child process closed stdout",
+                "child closed stdout while reading CL headers",
             ));
         }
-        let trimmed = line.trim();
+        let trimmed = header.trim();
         if trimmed.is_empty() {
-            continue;
+            break; // blank line separates headers from body
         }
-        return serde_json::from_str(trimmed)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e));
+        let lower = trimmed.to_ascii_lowercase();
+        if let Some(rest) = lower.strip_prefix("content-length:") {
+            let n: usize = rest.trim().parse().map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "invalid Content-Length value")
+            })?;
+            content_length = Some(n);
+        }
+        // Ignore other headers (Content-Type, etc.)
     }
+    let len = content_length.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Content-Length header missing in framed message",
+        )
+    })?;
+    let mut body = vec![0u8; len];
+    reader.read_exact(&mut body)?;
+    serde_json::from_slice(&body).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+/// Resume parsing a Content-Length frame when the first header line has already
+/// been read (as `first_header`).  Reads remaining headers and the body.
+fn read_content_length_body<R: BufRead>(reader: &mut R, first_header: &str) -> io::Result<Value> {
+    let lower = first_header.to_ascii_lowercase();
+    let mut content_length: Option<usize> =
+        if let Some(rest) = lower.strip_prefix("content-length:") {
+            rest.trim().parse().ok()
+        } else {
+            None
+        };
+    loop {
+        let mut header = String::new();
+        let n = reader.read_line(&mut header)?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "child closed stdout while reading CL headers",
+            ));
+        }
+        let trimmed = header.trim();
+        if trimmed.is_empty() {
+            break;
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        if let Some(rest) = lower.strip_prefix("content-length:") {
+            if let Ok(n) = rest.trim().parse() {
+                content_length = Some(n);
+            }
+        }
+    }
+    let len = content_length.ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "Content-Length header missing")
+    })?;
+    let mut body = vec![0u8; len];
+    reader.read_exact(&mut body)?;
+    serde_json::from_slice(&body).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
 /// The eight piggybank tool names — used for collision detection and dispatch.
@@ -178,17 +326,83 @@ fn piggybank_tool_defs() -> Vec<Value> {
     .expect("static tool defs are valid JSON")
 }
 
+/// Return the first sentence of `s` (up to and including the first `.` or `\n`).
+fn first_sentence_of(s: &str) -> &str {
+    for (i, ch) in s.char_indices() {
+        if ch == '.' || ch == '\n' {
+            return &s[..=i];
+        }
+    }
+    s
+}
+
+/// Trim a single tool entry for LLM consumption:
+/// - description → first sentence, capped at TOOL_DESC_CAP bytes
+/// - inputSchema → keep "type" and property names with only "type", drop
+///   verbose "description" fields inside properties; truncate if still large
+fn trim_tool(tool: &Value) -> Value {
+    let mut t = tool.clone();
+    if let Some(desc) = t.get("description").and_then(Value::as_str) {
+        let short = first_sentence_of(desc);
+        let short = if short.len() > TOOL_DESC_CAP {
+            &short[..TOOL_DESC_CAP]
+        } else {
+            short
+        };
+        t["description"] = json!(short);
+    }
+    if let Some(schema) = t.get("inputSchema").cloned() {
+        let slim = slim_schema(&schema);
+        t["inputSchema"] = slim;
+    }
+    t
+}
+
+/// Reduce an inputSchema object to just required fields and property names+types.
+fn slim_schema(schema: &Value) -> Value {
+    let mut out = json!({ "type": schema.get("type").cloned().unwrap_or(json!("object")) });
+    if let Some(required) = schema.get("required") {
+        out["required"] = required.clone();
+    }
+    if let Some(props) = schema.get("properties").and_then(Value::as_object) {
+        let mut slim_props = serde_json::Map::new();
+        for (k, v) in props {
+            let prop_type = v.get("type").cloned().unwrap_or(json!("string"));
+            slim_props.insert(k.clone(), json!({ "type": prop_type }));
+        }
+        out["properties"] = Value::Object(slim_props);
+    }
+    // If the slimmed schema is still large, truncate its JSON representation.
+    let s = out.to_string();
+    if s.len() > SCHEMA_CAP {
+        // Return a minimal placeholder so the tool is still callable.
+        json!({ "type": "object" })
+    } else {
+        out
+    }
+}
+
+/// Trim a list of tools for LLM consumption (unless full-tools mode is active).
+fn trim_tools_list(tools: &[Value]) -> Vec<Value> {
+    tools.iter().map(trim_tool).collect()
+}
+
 /// Merge child tools with piggybank tools.
 /// Child tools keep their names. If a child tool name collides with a
 /// piggybank tool name, the piggybank tool gets prefixed with `pb_`.
-fn merge_tools(child_tools: &[Value]) -> Vec<Value> {
-    let child_names: std::collections::HashSet<&str> = child_tools
+fn merge_tools(child_tools: &[Value], full_tools: bool) -> Vec<Value> {
+    let child_names: HashSet<&str> = child_tools
         .iter()
         .filter_map(|t| t.get("name").and_then(Value::as_str))
         .collect();
 
     let pb_defs = piggybank_tool_defs();
-    let mut merged: Vec<Value> = child_tools.to_vec();
+    let child_display: Vec<Value> = if full_tools {
+        child_tools.to_vec()
+    } else {
+        trim_tools_list(child_tools)
+    };
+    let mut merged: Vec<Value> = child_display;
 
     for mut pb_tool in pb_defs {
         let name = pb_tool
@@ -212,7 +426,7 @@ fn merge_tools(child_tools: &[Value]) -> Vec<Value> {
 /// Returns Some(canonical_pb_name) if this is a piggybank tool call.
 fn resolve_pb_tool<'a>(
     name: &'a str,
-    child_tool_names: &std::collections::HashSet<&str>,
+    child_tool_names: &HashSet<&str>,
 ) -> Option<&'a str> {
     // Direct match (no collision)
     if PB_TOOL_NAMES.contains(&name) && !child_tool_names.contains(name) {
@@ -448,10 +662,34 @@ fn pb_tool_response(id: Value, result: Result<Value, String>) -> Value {
     }
 }
 
-/// If the response's content[0].text exceeds the threshold, compress it
-/// and replace the text with a compressed view.
-fn maybe_compress_response(state: &ProxyState, response: &mut Value) {
+/// Build a JSON-RPC error frame for child-death situations.
+fn child_error_frame(id: Value, message: &str) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": -32000,
+            "message": message
+        }
+    })
+}
+
+/// If the response's content[0].text exceeds the threshold and the tool is not
+/// in the skip list, compress it and replace the text with a compressed view.
+/// Updates per-tool stats in `state`.
+fn maybe_compress_response(state: &mut ProxyState, tool_name: &str, response: &mut Value) {
+    // Never compress error frames.
+    if response.get("error").is_some() {
+        return;
+    }
+
     let threshold = state.threshold;
+
+    // Skip-list check.
+    if state.skip_tools.contains(tool_name) {
+        return;
+    }
+
     let text = response
         .get("result")
         .and_then(|r| r.get("content"))
@@ -460,27 +698,48 @@ fn maybe_compress_response(state: &ProxyState, response: &mut Value) {
         .and_then(Value::as_str)
         .map(|s| s.to_string());
 
+    // Record original bytes regardless of whether we compress.
+    let original_bytes = text.as_ref().map(|t| t.len()).unwrap_or(0);
+    let entry = state.per_tool_stats.entry(tool_name.to_string()).or_default();
+    entry.calls += 1;
+    entry.original_bytes += original_bytes as u64;
+
     let text = match text {
         Some(t) if t.len() > threshold => t,
-        _ => return,
-    };
-
-    let original_bytes = text.len();
-
-    // Try JSON compression first, then fall back to text.
-    let (view, kind) = if let Ok(compressed) =
-        piggybank_core::compress_json_with_store(text.as_bytes(), &state.store)
-    {
-        (encode_view("json", &compressed), "json")
-    } else {
-        match piggybank_core::compress_text(&state.store, text.as_bytes(), &TextOptions::default())
-        {
-            Ok(compressed) => (encode_view("text", &compressed), "text"),
-            Err(_) => return, // compression failed; pass through unchanged
+        _ => {
+            // Below threshold: track as-is.
+            let entry = state.per_tool_stats.get_mut(tool_name).unwrap();
+            entry.compressed_bytes += original_bytes as u64;
+            return;
         }
     };
 
-    let _ = kind; // used in encode_view above
+    // Try JSON compression first, then fall back to text.
+    let view = if let Ok(compressed) =
+        piggybank_core::compress_json_with_store(text.as_bytes(), &state.store)
+    {
+        encode_view("json", &compressed)
+    } else {
+        match piggybank_core::compress_text(&state.store, text.as_bytes(), &TextOptions::default())
+        {
+            Ok(compressed) => encode_view("text", &compressed),
+            Err(_) => {
+                // Compression failed; pass through unchanged.
+                let entry = state.per_tool_stats.get_mut(tool_name).unwrap();
+                entry.compressed_bytes += original_bytes as u64;
+                return;
+            }
+        }
+    };
+
+    let compressed_bytes = view.len();
+
+    // Only replace if compression actually saved bytes.
+    if compressed_bytes >= original_bytes {
+        let entry = state.per_tool_stats.get_mut(tool_name).unwrap();
+        entry.compressed_bytes += original_bytes as u64;
+        return;
+    }
 
     if let Some(result) = response.get_mut("result") {
         if let Some(content) = result.get_mut("content") {
@@ -495,6 +754,10 @@ fn maybe_compress_response(state: &ProxyState, response: &mut Value) {
             obj.insert("_original_bytes".to_string(), json!(original_bytes));
         }
     }
+
+    let entry = state.per_tool_stats.get_mut(tool_name).unwrap();
+    entry.compressed_bytes += compressed_bytes as u64;
+    entry.compressed_calls += 1;
 }
 
 fn next_child_id(state: &mut ProxyState) -> u64 {
@@ -504,6 +767,7 @@ fn next_child_id(state: &mut ProxyState) -> u64 {
 }
 
 fn handle_message(state: &mut ProxyState, msg: &Value) -> io::Result<Option<Value>> {
+    // Never alter notifications (no id field): forward and return None.
     let id = msg.get("id").cloned();
     let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
 
@@ -568,7 +832,15 @@ fn handle_message(state: &mut ProxyState, msg: &Value) -> io::Result<Option<Valu
                 "params": {}
             });
             send_to_child(state, &child_req)?;
-            let child_resp = read_from_child(state)?;
+            let child_resp = match read_from_child(state) {
+                Ok(v) => v,
+                Err(e) => {
+                    return Ok(Some(child_error_frame(
+                        caller_id,
+                        &format!("child process died during tools/list: {e}"),
+                    )));
+                }
+            };
 
             let child_tools: Vec<Value> = child_resp
                 .get("result")
@@ -578,7 +850,7 @@ fn handle_message(state: &mut ProxyState, msg: &Value) -> io::Result<Option<Valu
                 .unwrap_or_default();
 
             state.child_tools = child_tools.clone();
-            let merged = merge_tools(&child_tools);
+            let merged = merge_tools(&child_tools, state.full_tools);
 
             Ok(Some(json!({
                 "jsonrpc": "2.0",
@@ -594,17 +866,21 @@ fn handle_message(state: &mut ProxyState, msg: &Value) -> io::Result<Option<Valu
             };
 
             let params = msg.get("params").cloned().unwrap_or(json!({}));
-            let tool_name = params.get("name").and_then(Value::as_str).unwrap_or("");
+            let tool_name = params
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
             let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
 
-            let child_tool_names: std::collections::HashSet<&str> = state
+            let child_tool_names: HashSet<&str> = state
                 .child_tools
                 .iter()
                 .filter_map(|t| t.get("name").and_then(Value::as_str))
                 .collect();
 
-            if let Some(canonical) = resolve_pb_tool(tool_name, &child_tool_names) {
-                // Handle locally.
+            if let Some(canonical) = resolve_pb_tool(&tool_name, &child_tool_names) {
+                // Handle locally — never compress pb tool responses.
                 let result = handle_pb_tool(state, canonical, &arguments);
                 Ok(Some(pb_tool_response(caller_id, result)))
             } else {
@@ -617,10 +893,26 @@ fn handle_message(state: &mut ProxyState, msg: &Value) -> io::Result<Option<Valu
                     "params": params
                 });
                 send_to_child(state, &child_req)?;
-                let mut child_resp = read_from_child(state)?;
+                let mut child_resp = match read_from_child(state) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("piggybank-proxy: child died during tools/call({tool_name}): {e}");
+                        return Ok(Some(child_error_frame(
+                            caller_id,
+                            &format!("child process died during tools/call: {e}"),
+                        )));
+                    }
+                };
 
-                // Measure result before and after auto-compression.
-                let pre_compress_text = child_resp
+                // Never compress error results.
+                let is_error = child_resp
+                    .get("result")
+                    .and_then(|r| r.get("isError"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                    || child_resp.get("error").is_some();
+
+                let pre_bytes = child_resp
                     .get("result")
                     .and_then(|r| r.get("content"))
                     .and_then(|c| c.get(0))
@@ -628,11 +920,18 @@ fn handle_message(state: &mut ProxyState, msg: &Value) -> io::Result<Option<Valu
                     .and_then(Value::as_str)
                     .map(|s| s.len());
 
-                // Auto-compress if response is large.
-                maybe_compress_response(state, &mut child_resp);
+                if !is_error {
+                    maybe_compress_response(state, &tool_name, &mut child_resp);
+                } else {
+                    // Track the call even when not compressing.
+                    let entry = state.per_tool_stats.entry(tool_name.clone()).or_default();
+                    entry.calls += 1;
+                    let b = pre_bytes.unwrap_or(0) as u64;
+                    entry.original_bytes += b;
+                    entry.compressed_bytes += b;
+                }
 
-                // Emit ToolCall harvest event.
-                let post_compress_text = child_resp
+                let post_bytes = child_resp
                     .get("result")
                     .and_then(|r| r.get("content"))
                     .and_then(|c| c.get(0))
@@ -644,22 +943,20 @@ fn handle_message(state: &mut ProxyState, msg: &Value) -> io::Result<Option<Valu
                     .and_then(|r| r.get("_piggybank_compressed"))
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
-                let result_bytes = post_compress_text.unwrap_or(0);
+                let result_bytes = post_bytes.unwrap_or(0);
                 let compression_ratio = if auto_compressed {
-                    match (pre_compress_text, post_compress_text) {
+                    match (pre_bytes, post_bytes) {
                         (Some(orig), Some(comp)) if orig > 0 => Some(comp as f64 / orig as f64),
                         _ => None,
                     }
                 } else {
                     None
                 };
-                // Extract server name from the tool name (best-effort: use child process command).
-                let server_name = "child".to_string();
                 state.harvester.log(HarvestEvent::ToolCall {
                     ts: harvest::now(),
                     session_id: state.harvester.session_id().to_string(),
-                    server: server_name,
-                    tool: tool_name.to_string(),
+                    server: state.server_name.clone(),
+                    tool: tool_name.clone(),
                     result_bytes,
                     auto_compressed,
                     compression_ratio,
@@ -676,6 +973,7 @@ fn handle_message(state: &mut ProxyState, msg: &Value) -> io::Result<Option<Valu
 
         _ => {
             // Forward all other methods transparently to child.
+            // Never alter JSON-RPC ids on forwarded requests.
             match id {
                 None => {
                     // Notification: forward, no response.
@@ -689,7 +987,15 @@ fn handle_message(state: &mut ProxyState, msg: &Value) -> io::Result<Option<Valu
                         obj.insert("id".to_string(), json!(child_id));
                     }
                     send_to_child(state, &forwarded)?;
-                    let mut child_resp = read_from_child(state)?;
+                    let mut child_resp = match read_from_child(state) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            return Ok(Some(child_error_frame(
+                                caller_id,
+                                &format!("child process died: {e}"),
+                            )));
+                        }
+                    };
                     if let Some(obj) = child_resp.as_object_mut() {
                         obj.insert("id".to_string(), caller_id);
                     }
@@ -700,12 +1006,55 @@ fn handle_message(state: &mut ProxyState, msg: &Value) -> io::Result<Option<Valu
     }
 }
 
+/// Write per-tool stats as JSON to a file (or stderr if path is "-").
+pub fn write_stats(stats: &HashMap<String, ToolStats>, path: &str) {
+    let entries: Vec<Value> = {
+        let mut pairs: Vec<(&String, &ToolStats)> = stats.iter().collect();
+        pairs.sort_by(|a, b| b.1.savings_bytes().cmp(&a.1.savings_bytes()));
+        pairs
+            .into_iter()
+            .map(|(name, s)| {
+                json!({
+                    "tool": name,
+                    "calls": s.calls,
+                    "compressed_calls": s.compressed_calls,
+                    "original_bytes": s.original_bytes,
+                    "compressed_bytes": s.compressed_bytes,
+                    "saved_bytes": s.savings_bytes(),
+                    "ratio": (s.ratio() * 1000.0).round() / 1000.0,
+                })
+            })
+            .collect()
+    };
+    let total_orig: u64 = stats.values().map(|s| s.original_bytes).sum();
+    let total_comp: u64 = stats.values().map(|s| s.compressed_bytes).sum();
+    let total_calls: u64 = stats.values().map(|s| s.calls).sum();
+    let out = json!({
+        "summary": {
+            "total_calls": total_calls,
+            "total_original_bytes": total_orig,
+            "total_compressed_bytes": total_comp,
+            "total_saved_bytes": total_orig.saturating_sub(total_comp),
+        },
+        "per_tool": entries,
+    });
+    let text = serde_json::to_string_pretty(&out).unwrap_or_default();
+    if path == "-" {
+        eprintln!("{text}");
+    } else if let Err(e) = std::fs::write(path, &text) {
+        eprintln!("piggybank-proxy: failed to write stats to {path}: {e}");
+    }
+}
+
 pub fn run_proxy(
     command: &str,
     args: &[String],
     threshold: usize,
     store_dir: &Path,
     harvester: Harvester,
+    skip_tools: HashSet<String>,
+    full_tools: bool,
+    stats_file: Option<String>,
 ) -> io::Result<()> {
     let mut child = spawn_child(command, args).map_err(|e| {
         io::Error::new(
@@ -717,15 +1066,27 @@ pub fn run_proxy(
     let store = Store::open(store_dir)?;
     let session = Session::open(store_dir)?;
 
+    // Use the command basename as the server name for harvest events.
+    let server_name = Path::new(command)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(command)
+        .to_string();
+
     let mut state = ProxyState {
         child_stdin: child.stdin.take().expect("child stdin must be piped"),
         child_stdout: BufReader::new(child.stdout.take().expect("child stdout must be piped")),
+        child_framing: Framing::Newline,
         child_tools: vec![],
         next_child_id: 1000,
         store,
         session,
         threshold,
         harvester,
+        skip_tools,
+        per_tool_stats: HashMap::new(),
+        full_tools,
+        server_name,
     };
 
     let stdin = io::stdin();
@@ -747,7 +1108,6 @@ pub fn run_proxy(
         let response = match handle_message(&mut state, &msg) {
             Ok(r) => r,
             Err(e) => {
-                // Child died or IO error — exit cleanly.
                 eprintln!("piggybank-proxy: IO error handling message: {e}");
                 break;
             }
@@ -761,6 +1121,11 @@ pub fn run_proxy(
         }
     }
 
+    // Write stats before exit.
+    if let Some(ref path) = stats_file {
+        write_stats(&state.per_tool_stats, path);
+    }
+
     // Clean up: drop child stdin to signal EOF, then wait for child to exit.
     drop(state.child_stdin);
     let _ = child.wait();
@@ -770,12 +1135,25 @@ pub fn run_proxy(
 /// Parse proxy subcommand args and invoke run_proxy.
 ///
 /// Expected format:
-///   [--threshold <bytes>] [--store-dir <path>] [--harvest <path>] [--harvest-url <url>] -- <command> [args...]
+///   [--threshold <bytes>] [--store-dir <path>] [--harvest <path>] [--harvest-url <url>]
+///   [--stats-file <path>] [--full-tools] -- <command> [args...]
 pub fn run_proxy_from_args(all_args: &[String]) -> io::Result<()> {
-    let mut threshold = DEFAULT_THRESHOLD;
+    let mut threshold = std::env::var("PIGGYBANK_MIN_BYTES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_THRESHOLD);
     let mut store_dir: Option<String> = None;
     let mut harvest_path: Option<String> = None;
     let mut harvest_url: Option<String> = None;
+    let mut stats_file: Option<String> = None;
+    let mut full_tools =
+        std::env::var("PIGGYBANK_PROXY_FULL_TOOLS").as_deref() == Ok("1");
+    let skip_tools: HashSet<String> = std::env::var("PIGGYBANK_SKIP_TOOLS")
+        .unwrap_or_default()
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.trim().to_string())
+        .collect();
 
     // Find the `--` separator.
     let sep_pos = all_args.iter().position(|a| a == "--").ok_or_else(|| {
@@ -852,6 +1230,26 @@ pub fn run_proxy_from_args(all_args: &[String]) -> io::Result<()> {
                         .clone(),
                 );
             }
+            "--stats-file" => {
+                i += 1;
+                stats_file = Some(
+                    proxy_args
+                        .get(i)
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "--stats-file requires a path (use '-' for stderr)",
+                            )
+                        })?
+                        .clone(),
+                );
+            }
+            "--stats" => {
+                stats_file = Some("-".to_string());
+            }
+            "--full-tools" => {
+                full_tools = true;
+            }
             other => {
                 eprintln!("piggybank-proxy: unknown option '{other}', ignoring");
             }
@@ -878,7 +1276,16 @@ pub fn run_proxy_from_args(all_args: &[String]) -> io::Result<()> {
     let command = &child_argv[0];
     let args = &child_argv[1..];
 
-    run_proxy(command, args, threshold, Path::new(&store_dir), harvester)
+    run_proxy(
+        command,
+        args,
+        threshold,
+        Path::new(&store_dir),
+        harvester,
+        skip_tools,
+        full_tools,
+        stats_file,
+    )
 }
 
 #[cfg(test)]
@@ -891,7 +1298,7 @@ mod tests {
             json!({ "name": "list_files", "description": "list files" }),
             json!({ "name": "read_file", "description": "read a file" }),
         ];
-        let merged = merge_tools(&child_tools);
+        let merged = merge_tools(&child_tools, true);
         let names: Vec<&str> = merged
             .iter()
             .filter_map(|t| t.get("name").and_then(Value::as_str))
@@ -911,7 +1318,7 @@ mod tests {
     #[test]
     fn merge_tools_with_collision() {
         let child_tools = vec![json!({ "name": "compress", "description": "child compress" })];
-        let merged = merge_tools(&child_tools);
+        let merged = merge_tools(&child_tools, true);
         let names: Vec<&str> = merged
             .iter()
             .filter_map(|t| t.get("name").and_then(Value::as_str))
@@ -927,7 +1334,7 @@ mod tests {
 
     #[test]
     fn resolve_pb_tool_no_collision() {
-        let child_names = std::collections::HashSet::new();
+        let child_names = HashSet::new();
         assert_eq!(resolve_pb_tool("compress", &child_names), Some("compress"));
         assert_eq!(resolve_pb_tool("stats", &child_names), Some("stats"));
         assert_eq!(resolve_pb_tool("list_files", &child_names), None);
@@ -935,7 +1342,7 @@ mod tests {
 
     #[test]
     fn resolve_pb_tool_with_collision() {
-        let mut child_names = std::collections::HashSet::new();
+        let mut child_names = HashSet::new();
         child_names.insert("compress");
         // Direct name is taken by child
         assert_eq!(resolve_pb_tool("compress", &child_names), None);
@@ -949,32 +1356,52 @@ mod tests {
     }
 
     #[test]
-    fn maybe_compress_response_below_threshold() {
-        let dir = std::env::temp_dir().join(format!("pb-proxy-test-nc-{}", std::process::id()));
-        let store = Store::open(&dir).unwrap();
-        let session = Session::open(&dir).unwrap();
-        // Use a fake child_stdin/stdout — we won't call child I/O in this test.
-        // Instead test maybe_compress_response directly.
-        let short_text = "hello world";
-        let response = json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "result": {
-                "content": [{ "type": "text", "text": short_text }]
+    fn trim_tool_trims_description_at_first_sentence() {
+        let tool = json!({
+            "name": "example",
+            "description": "First sentence. Second sentence with more detail.",
+            "inputSchema": { "type": "object", "properties": {} }
+        });
+        let trimmed = trim_tool(&tool);
+        let desc = trimmed.get("description").and_then(Value::as_str).unwrap();
+        assert_eq!(desc, "First sentence.");
+    }
+
+    #[test]
+    fn trim_tool_preserves_no_period() {
+        let tool = json!({
+            "name": "example",
+            "description": "No period here",
+            "inputSchema": { "type": "object", "properties": {} }
+        });
+        let trimmed = trim_tool(&tool);
+        let desc = trimmed.get("description").and_then(Value::as_str).unwrap();
+        assert_eq!(desc, "No period here");
+    }
+
+    #[test]
+    fn slim_schema_drops_descriptions() {
+        let schema = json!({
+            "type": "object",
+            "required": ["x"],
+            "properties": {
+                "x": { "type": "string", "description": "very verbose description" },
+                "y": { "type": "integer", "description": "another verbose one" }
             }
         });
+        let slim = slim_schema(&schema);
+        let props = slim.get("properties").unwrap();
+        // Property descriptions are stripped.
+        assert!(props["x"].get("description").is_none());
+        assert_eq!(props["x"]["type"].as_str(), Some("string"));
+        assert_eq!(props["y"]["type"].as_str(), Some("integer"));
+    }
 
-        // Build a minimal state just for the store/session/threshold fields.
-        // We can't construct ProxyState without live child pipes, so test the
-        // logic via a helper that accepts store + threshold directly.
-        let threshold = 4096;
-        let _ = (store, session, threshold); // used in the real function
-                                             // Since text is < threshold, response must be unchanged.
-        assert_eq!(
-            response["result"]["content"][0]["text"].as_str(),
-            Some(short_text)
-        );
-        std::fs::remove_dir_all(&dir).ok();
+    #[test]
+    fn first_sentence_basic() {
+        assert_eq!(first_sentence_of("Hello world. More text."), "Hello world.");
+        assert_eq!(first_sentence_of("No period"), "No period");
+        assert_eq!(first_sentence_of("Line one\nLine two"), "Line one\n");
     }
 
     #[test]
@@ -999,5 +1426,18 @@ mod tests {
         let err = run_proxy_from_args(&args).unwrap_err();
         // Should fail at spawn, not at arg parsing.
         assert_ne!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn write_stats_empty() {
+        let stats: HashMap<String, ToolStats> = HashMap::new();
+        // Should not panic.
+        write_stats(&stats, "-");
+    }
+
+    #[test]
+    fn tool_stats_ratio_empty() {
+        let s = ToolStats::default();
+        assert!((s.ratio() - 1.0).abs() < f64::EPSILON);
     }
 }
