@@ -56,7 +56,27 @@ The compression is built on a content-addressed, atomically-written, crash-safe 
 
 ## Setup
 
-Add to your MCP config (`~/.claude.json` or project `.mcp.json`):
+The fastest way to install:
+
+```bash
+npx piggybank-mcp init
+```
+
+This one command:
+- Adds `piggybank` to `mcpServers` in `~/.claude.json`
+- Installs hook scripts to `~/.piggybank/hooks/`
+- Merges `PostToolUse` (compress all tool outputs) and `PreCompact` (build a compaction ledger) hook entries into `~/.claude/settings.json` idempotently
+- Backs up settings files before modifying them
+- Prints every change made
+
+Options:
+
+```bash
+npx piggybank-mcp init --dry-run      # preview changes without applying
+npx piggybank-mcp init --uninstall    # remove all piggybank configuration
+```
+
+Or configure manually in `~/.claude.json`:
 
 ```json
 {

@@ -1,3 +1,4 @@
+mod init;
 mod mcp;
 mod proxy;
 mod statusline;
@@ -21,6 +22,8 @@ fn main() -> ExitCode {
         Some("decompress-log") => run_text(&args, false),
         Some("compress-session") => run_session_compress(&args),
         Some("decompress-session") => run_session_decompress(&args),
+        Some("init") => init::run_init(&args),
+        Some("ledger") => run_ledger(&args),
         Some("mcp") if args.get(2).map(String::as_str) == Some("serve") => run_mcp_serve(&args),
         Some("gc") => run_gc(&args),
         Some("proxy") => run_proxy_cmd(&args),
@@ -30,6 +33,59 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn run_ledger(args: &[String]) -> ExitCode {
+    let Some(transcript_path) = args.get(2) else {
+        eprintln!(
+            "usage: piggybank ledger <transcript.jsonl> [--store-dir <path>] [--min-bytes <N>]"
+        );
+        return ExitCode::FAILURE;
+    };
+    let store_dir = args
+        .iter()
+        .position(|a| a == "--store-dir")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_else(|| {
+            std::env::var("HOME")
+                .map(|h| format!("{h}/.piggybank/store"))
+                .unwrap_or_else(|_| ".piggybank-store".to_string())
+        });
+    let min_bytes = args
+        .iter()
+        .position(|a| a == "--min-bytes")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(2048);
+
+    let store = match Store::open(&store_dir) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error opening store {store_dir}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let opts = piggybank_core::ledger::LedgerOptions {
+        min_bytes,
+        ..Default::default()
+    };
+
+    let path = std::path::Path::new(transcript_path);
+    let entries = match piggybank_core::ledger::build_ledger(path, &store, &opts) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("error reading transcript {transcript_path}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let index = piggybank_core::ledger::format_index(&entries, &opts);
+    if !index.is_empty() {
+        println!("{index}");
+    }
+    ExitCode::SUCCESS
 }
 
 fn usage() {
@@ -47,6 +103,8 @@ fn usage() {
     );
     eprintln!("                       [--stats] [--full-tools] -- <cmd> [args...]  # transparent MCP proxy with auto-compression");
     eprintln!("       piggybank statusline [--store-dir <path>] [--plain]         # one-line savings summary (today + lifetime)");
+    eprintln!("       piggybank init [--dry-run] [--uninstall] [--store-dir <path>]  # install MCP + hooks into ~/.claude");
+    eprintln!("       piggybank ledger <transcript.jsonl> [--store-dir <path>] [--min-bytes <N>]  # build compaction ledger index");
 }
 
 fn run_proxy_cmd(args: &[String]) -> ExitCode {
