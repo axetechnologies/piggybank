@@ -1022,7 +1022,7 @@ pub struct ProxyConfig {
 pub fn write_stats(stats: &HashMap<String, ToolStats>, path: &str) {
     let entries: Vec<Value> = {
         let mut pairs: Vec<(&String, &ToolStats)> = stats.iter().collect();
-        pairs.sort_by(|a, b| b.1.savings_bytes().cmp(&a.1.savings_bytes()));
+        pairs.sort_by_key(|a| std::cmp::Reverse(a.1.savings_bytes()));
         pairs
             .into_iter()
             .map(|(name, s)| {
