@@ -424,10 +424,7 @@ fn merge_tools(child_tools: &[Value], full_tools: bool) -> Vec<Value> {
 
 /// Resolve the actual piggybank tool name from the called name.
 /// Returns Some(canonical_pb_name) if this is a piggybank tool call.
-fn resolve_pb_tool<'a>(
-    name: &'a str,
-    child_tool_names: &HashSet<&str>,
-) -> Option<&'a str> {
+fn resolve_pb_tool<'a>(name: &'a str, child_tool_names: &HashSet<&str>) -> Option<&'a str> {
     // Direct match (no collision)
     if PB_TOOL_NAMES.contains(&name) && !child_tool_names.contains(name) {
         return Some(name);
@@ -700,7 +697,10 @@ fn maybe_compress_response(state: &mut ProxyState, tool_name: &str, response: &m
 
     // Record original bytes regardless of whether we compress.
     let original_bytes = text.as_ref().map(|t| t.len()).unwrap_or(0);
-    let entry = state.per_tool_stats.entry(tool_name.to_string()).or_default();
+    let entry = state
+        .per_tool_stats
+        .entry(tool_name.to_string())
+        .or_default();
     entry.calls += 1;
     entry.original_bytes += original_bytes as u64;
 
@@ -896,7 +896,9 @@ fn handle_message(state: &mut ProxyState, msg: &Value) -> io::Result<Option<Valu
                 let mut child_resp = match read_from_child(state) {
                     Ok(v) => v,
                     Err(e) => {
-                        eprintln!("piggybank-proxy: child died during tools/call({tool_name}): {e}");
+                        eprintln!(
+                            "piggybank-proxy: child died during tools/call({tool_name}): {e}"
+                        );
                         return Ok(Some(child_error_frame(
                             caller_id,
                             &format!("child process died during tools/call: {e}"),
@@ -1006,6 +1008,16 @@ fn handle_message(state: &mut ProxyState, msg: &Value) -> io::Result<Option<Valu
     }
 }
 
+/// Configuration for `run_proxy`.
+pub struct ProxyConfig {
+    pub threshold: usize,
+    pub store_dir: std::path::PathBuf,
+    pub harvester: Harvester,
+    pub skip_tools: HashSet<String>,
+    pub full_tools: bool,
+    pub stats_file: Option<String>,
+}
+
 /// Write per-tool stats as JSON to a file (or stderr if path is "-").
 pub fn write_stats(stats: &HashMap<String, ToolStats>, path: &str) {
     let entries: Vec<Value> = {
@@ -1046,16 +1058,7 @@ pub fn write_stats(stats: &HashMap<String, ToolStats>, path: &str) {
     }
 }
 
-pub fn run_proxy(
-    command: &str,
-    args: &[String],
-    threshold: usize,
-    store_dir: &Path,
-    harvester: Harvester,
-    skip_tools: HashSet<String>,
-    full_tools: bool,
-    stats_file: Option<String>,
-) -> io::Result<()> {
+pub fn run_proxy(command: &str, args: &[String], cfg: ProxyConfig) -> io::Result<()> {
     let mut child = spawn_child(command, args).map_err(|e| {
         io::Error::new(
             e.kind(),
@@ -1063,8 +1066,8 @@ pub fn run_proxy(
         )
     })?;
 
-    let store = Store::open(store_dir)?;
-    let session = Session::open(store_dir)?;
+    let store = Store::open(&cfg.store_dir)?;
+    let session = Session::open(&cfg.store_dir)?;
 
     // Use the command basename as the server name for harvest events.
     let server_name = Path::new(command)
@@ -1081,11 +1084,11 @@ pub fn run_proxy(
         next_child_id: 1000,
         store,
         session,
-        threshold,
-        harvester,
-        skip_tools,
+        threshold: cfg.threshold,
+        harvester: cfg.harvester,
+        skip_tools: cfg.skip_tools,
         per_tool_stats: HashMap::new(),
-        full_tools,
+        full_tools: cfg.full_tools,
         server_name,
     };
 
@@ -1122,7 +1125,7 @@ pub fn run_proxy(
     }
 
     // Write stats before exit.
-    if let Some(ref path) = stats_file {
+    if let Some(ref path) = cfg.stats_file {
         write_stats(&state.per_tool_stats, path);
     }
 
@@ -1146,8 +1149,7 @@ pub fn run_proxy_from_args(all_args: &[String]) -> io::Result<()> {
     let mut harvest_path: Option<String> = None;
     let mut harvest_url: Option<String> = None;
     let mut stats_file: Option<String> = None;
-    let mut full_tools =
-        std::env::var("PIGGYBANK_PROXY_FULL_TOOLS").as_deref() == Ok("1");
+    let mut full_tools = std::env::var("PIGGYBANK_PROXY_FULL_TOOLS").as_deref() == Ok("1");
     let skip_tools: HashSet<String> = std::env::var("PIGGYBANK_SKIP_TOOLS")
         .unwrap_or_default()
         .split(',')
@@ -1279,12 +1281,14 @@ pub fn run_proxy_from_args(all_args: &[String]) -> io::Result<()> {
     run_proxy(
         command,
         args,
-        threshold,
-        Path::new(&store_dir),
-        harvester,
-        skip_tools,
-        full_tools,
-        stats_file,
+        ProxyConfig {
+            threshold,
+            store_dir: Path::new(&store_dir).to_path_buf(),
+            harvester,
+            skip_tools,
+            full_tools,
+            stats_file,
+        },
     )
 }
 
