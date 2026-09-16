@@ -1,5 +1,6 @@
 mod init;
 mod mcp;
+mod metrics;
 mod proxy;
 mod statusline;
 
