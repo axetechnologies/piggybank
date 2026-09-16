@@ -146,12 +146,17 @@ impl MetricsStore {
     /// Return the adaptive suggested_min_bytes for a tool (0 = system default).
     pub fn suggested_min_bytes(&self, tool: &str) -> usize {
         let Ok(g) = self.inner.lock() else { return 0 };
-        g.tools.get(tool).map(|e| e.suggested_min_bytes()).unwrap_or(0)
+        g.tools
+            .get(tool)
+            .map(|e| e.suggested_min_bytes())
+            .unwrap_or(0)
     }
 
     /// Build the `by_tool` / `by_key` / `masked_total` section for the stats response.
     pub fn stats_json(&self) -> Value {
-        let Ok(g) = self.inner.lock() else { return json!({}) };
+        let Ok(g) = self.inner.lock() else {
+            return json!({});
+        };
 
         let mut tools_vec: Vec<(&String, &ToolEntry)> = g.tools.iter().collect();
         tools_vec.sort_by(|a, b| b.1.compressions.cmp(&a.1.compressions));
@@ -217,19 +222,23 @@ fn load_from_file(path: &std::path::Path) -> Inner {
 
     if let Some(obj) = v.get("tools").and_then(Value::as_object) {
         for (name, entry) in obj {
-            let mut te = ToolEntry::default();
-            te.compressions = entry["compressions"].as_u64().unwrap_or(0);
-            te.retrieves = entry["retrieves"].as_u64().unwrap_or(0);
-            te.bytes_saved = entry["bytes_saved"].as_i64().unwrap_or(0);
-            te.bytes_retrieved = entry["bytes_retrieved"].as_u64().unwrap_or(0);
-            if let Some(arr) = entry["recent"].as_array() {
-                te.recent = arr
+            let recent = if let Some(arr) = entry["recent"].as_array() {
+                let full: Vec<u8> = arr
                     .iter()
                     .filter_map(|x| x.as_u64().map(|n| n as u8))
                     .collect();
-                let start = te.recent.len().saturating_sub(RECENT_WINDOW);
-                te.recent = te.recent[start..].to_vec();
-            }
+                let start = full.len().saturating_sub(RECENT_WINDOW);
+                full[start..].to_vec()
+            } else {
+                Vec::new()
+            };
+            let te = ToolEntry {
+                compressions: entry["compressions"].as_u64().unwrap_or(0),
+                retrieves: entry["retrieves"].as_u64().unwrap_or(0),
+                bytes_saved: entry["bytes_saved"].as_i64().unwrap_or(0),
+                bytes_retrieved: entry["bytes_retrieved"].as_u64().unwrap_or(0),
+                recent,
+            };
             inner.tools.insert(name.clone(), te);
         }
     }

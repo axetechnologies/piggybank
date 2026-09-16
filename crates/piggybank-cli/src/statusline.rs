@@ -9,7 +9,7 @@
 //! `piggybank_core::token_est`. Pass `--model <id>` or set `PIGGYBANK_MODEL`
 //! to select a pricing tier.
 
-use piggybank_core::token_est::{ContentClass, model_from_env, model_pricing, tokens_from_bytes};
+use piggybank_core::token_est::{model_from_env, model_pricing, tokens_from_bytes, ContentClass};
 use serde_json::Value;
 use std::path::Path;
 use std::process::ExitCode;

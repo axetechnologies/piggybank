@@ -20,7 +20,7 @@
 /// Returns true unless `PIGGYBANK_MASK=off` is set.
 pub fn masking_enabled() -> bool {
     std::env::var("PIGGYBANK_MASK")
-        .map(|v| v.to_ascii_lowercase() != "off")
+        .map(|v| !v.eq_ignore_ascii_case("off"))
         .unwrap_or(true)
 }
 
@@ -49,7 +49,11 @@ pub fn mask_secrets(text: &str) -> (String, usize) {
             pos += len;
         } else {
             // Advance one UTF-8 character.
-            let ch_len = text[pos..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+            let ch_len = text[pos..]
+                .chars()
+                .next()
+                .map(|c| c.len_utf8())
+                .unwrap_or(1);
             out.push_str(&text[pos..pos + ch_len]);
             pos += ch_len;
         }
@@ -85,6 +89,46 @@ fn is_base64url(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b'='
 }
 
+/// Two-pass helper: check if `b` starts with a named, specific-prefix secret
+/// (AWS, GitHub, Slack, Google, npm). Returns the kind if matched.
+/// Used inside assignment patterns so that `token=ghp_AAAA...` emits kind
+/// `github_token` rather than the generic `token`.
+fn specific_prefix_kind(b: &[u8]) -> Option<&'static str> {
+    if b.starts_with(b"AKIA")
+        && b.len() >= 16
+        && b[4..].iter().take(16).all(|&c| is_upper_alphanum(c))
+    {
+        return Some("aws_key");
+    }
+    if b.starts_with(b"github_pat_")
+        && b.len() >= 82
+        && b[11..]
+            .iter()
+            .take(82)
+            .all(|&c| is_alphanum_or_underscore(c))
+    {
+        return Some("github_pat");
+    }
+    if b.starts_with(b"ghp_") && b.len() >= 36 && b[4..].iter().take(36).all(|&c| is_alphanum(c)) {
+        return Some("github_token");
+    }
+    if b.starts_with(b"gho_") && b.len() >= 36 && b[4..].iter().take(36).all(|&c| is_alphanum(c)) {
+        return Some("github_oauth");
+    }
+    if (b.starts_with(b"xoxa-") || b.starts_with(b"xoxb-") || b.starts_with(b"xoxp-"))
+        && b.len() >= 20
+    {
+        return Some("slack_token");
+    }
+    if b.starts_with(b"AIza") && b.len() >= 35 {
+        return Some("google_api_key");
+    }
+    if b.starts_with(b"npm_") && b.len() >= 36 && b[4..].iter().take(36).all(|&c| is_alphanum(c)) {
+        return Some("npm_token");
+    }
+    None
+}
+
 /// Core detection. Returns `(kind, byte_length)` if a secret starts at `s`.
 /// `at_word_boundary` is true when the byte before `s` in the parent string
 /// is non-alphanumeric (or `s` is at position 0), used to guard assignment
@@ -96,29 +140,27 @@ fn detect_secret_at(s: &str, at_word_boundary: bool) -> Option<(&'static str, us
     }
 
     // ── AWS access key: AKIA + 16 uppercase alphanumeric ──────────────────
-    if b.starts_with(b"AKIA") && b.len() >= 20
+    if b.starts_with(b"AKIA")
+        && b.len() >= 20
         && b[4..20].iter().all(|&c| is_upper_alphanum(c))
-        && b.get(20).map_or(true, |&c| !is_upper_alphanum(c))
+        && b.get(20).is_none_or(|&c| !is_upper_alphanum(c))
     {
         return Some(("aws_key", 20));
     }
 
     // ── GitHub personal access token: ghp_ + 36 alphanum ──────────────────
-    if b.starts_with(b"ghp_") && b.len() >= 40
-        && b[4..40].iter().all(|&c| is_alphanum(c))
-    {
+    if b.starts_with(b"ghp_") && b.len() >= 40 && b[4..40].iter().all(|&c| is_alphanum(c)) {
         return Some(("github_token", 40));
     }
 
     // ── GitHub OAuth token: gho_ + 36 alphanum ────────────────────────────
-    if b.starts_with(b"gho_") && b.len() >= 40
-        && b[4..40].iter().all(|&c| is_alphanum(c))
-    {
+    if b.starts_with(b"gho_") && b.len() >= 40 && b[4..40].iter().all(|&c| is_alphanum(c)) {
         return Some(("github_oauth", 40));
     }
 
     // ── GitHub fine-grained PAT: github_pat_ + 82 alphanum/underscore ─────
-    if b.starts_with(b"github_pat_") && b.len() >= 93
+    if b.starts_with(b"github_pat_")
+        && b.len() >= 93
         && b[11..93].iter().all(|&c| is_alphanum_or_underscore(c))
     {
         return Some(("github_pat", 93));
@@ -139,7 +181,8 @@ fn detect_secret_at(s: &str, at_word_boundary: bool) -> Option<(&'static str, us
     }
 
     // ── Google API key: AIza + 35 alphanum/underscore/hyphen ──────────────
-    if b.starts_with(b"AIza") && b.len() >= 39
+    if b.starts_with(b"AIza")
+        && b.len() >= 39
         && b[4..39]
             .iter()
             .all(|&c| is_alphanum(c) || c == b'_' || c == b'-')
@@ -148,9 +191,7 @@ fn detect_secret_at(s: &str, at_word_boundary: bool) -> Option<(&'static str, us
     }
 
     // ── npm token: npm_ + 36 alphanum ─────────────────────────────────────
-    if b.starts_with(b"npm_") && b.len() >= 40
-        && b[4..40].iter().all(|&c| is_alphanum(c))
-    {
+    if b.starts_with(b"npm_") && b.len() >= 40 && b[4..40].iter().all(|&c| is_alphanum(c)) {
         return Some(("npm_token", 40));
     }
 
@@ -177,6 +218,9 @@ fn detect_secret_at(s: &str, at_word_boundary: bool) -> Option<(&'static str, us
     }
 
     // ── Assignment secrets (word-boundary-gated) ───────────────────────────
+    // Two-pass: check if the value starts with a specific named prefix and if
+    // so emit the precise kind (e.g. `github_token`) instead of the generic
+    // one (e.g. `token`).
     if at_word_boundary {
         for &(prefix, kind, min_val_len) in &[
             (b"password=" as &[u8], "password", 8usize),
@@ -188,7 +232,8 @@ fn detect_secret_at(s: &str, at_word_boundary: bool) -> Option<(&'static str, us
                 let start = prefix.len();
                 let (val_start, end) = value_span(b, start);
                 if end - val_start >= min_val_len {
-                    return Some((kind, end));
+                    let precise = specific_prefix_kind(&b[val_start..]).unwrap_or(kind);
+                    return Some((precise, end));
                 }
             }
         }
@@ -262,7 +307,7 @@ fn pem_block_len(s: &str) -> Option<usize> {
 
 /// Detect `scheme://user:pass@host[/path]`. Returns total URL length on match.
 fn url_with_creds_len(s: &str) -> Option<usize> {
-    let scheme_end = s.find("://")?  + 3;
+    let scheme_end = s.find("://")? + 3;
     let rest = &s[scheme_end..];
     let at = rest.find('@')?;
     let slash = rest.find('/').unwrap_or(rest.len());
@@ -353,7 +398,10 @@ mod tests {
         let (out, n) = mask("key=AKIAIOSFODNN7EXAMPLE rest");
         assert_eq!(n, 1, "should mask one secret");
         assert!(out.contains("[MASKED:aws_key:"), "got: {out}");
-        assert!(!out.contains("AKIAIOSFODNN7EXAMPLE"), "raw key must not appear: {out}");
+        assert!(
+            !out.contains("AKIAIOSFODNN7EXAMPLE"),
+            "raw key must not appear: {out}"
+        );
     }
 
     #[test]
@@ -453,7 +501,8 @@ mod tests {
 
     #[test]
     fn masks_pem_private_key() {
-        let pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA...\n-----END RSA PRIVATE KEY-----\n";
+        let pem =
+            "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA...\n-----END RSA PRIVATE KEY-----\n";
         let (out, n) = mask(pem);
         assert_eq!(n, 1, "got: {out}");
         assert!(out.contains("[MASKED:private_key:"), "got: {out}");
@@ -484,6 +533,34 @@ mod tests {
         let (out, n) = mask(&jwt);
         assert_eq!(n, 1, "got: {out}");
         assert!(out.contains("[MASKED:jwt:"), "got: {out}");
+    }
+
+    // ── Two-pass precision tests ──────────────────────────────────────────
+
+    #[test]
+    fn two_pass_token_eq_ghp_gets_github_kind() {
+        // When `token=ghp_AAAA...` is scanned, the two-pass logic must emit
+        // `github_token` (specific), not `token` (generic).
+        let value = "ghp_".to_string() + &"A".repeat(36);
+        let input = format!("token={value}");
+        let (out, n) = mask(&input);
+        assert_eq!(n, 1, "should mask exactly one secret; got: {out}");
+        assert!(
+            out.contains("[MASKED:github_token:"),
+            "expected github_token kind; got: {out}"
+        );
+    }
+
+    #[test]
+    fn two_pass_secret_eq_npm_token_gets_npm_kind() {
+        let value = "npm_".to_string() + &"B".repeat(36);
+        let input = format!("secret={value}");
+        let (out, n) = mask(&input);
+        assert_eq!(n, 1, "got: {out}");
+        assert!(
+            out.contains("[MASKED:npm_token:"),
+            "expected npm_token kind; got: {out}"
+        );
     }
 
     // ── False-positive fixtures ────────────────────────────────────────────
@@ -541,7 +618,10 @@ mod tests {
     fn does_not_mask_url_user_only() {
         // No colon → no password → not credentials.
         let (out, n) = mask("https://user@github.com/org/repo");
-        assert_eq!(n, 0, "URL with only user (no password) must not be masked; got: {out}");
+        assert_eq!(
+            n, 0,
+            "URL with only user (no password) must not be masked; got: {out}"
+        );
     }
 
     #[test]

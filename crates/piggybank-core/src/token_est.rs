@@ -57,7 +57,9 @@ pub fn classify(bytes: &[u8]) -> ContentClass {
     }
 
     // Trim leading whitespace to check for JSON opener.
-    let trimmed = bytes.iter().position(|&b| !b.is_ascii_whitespace())
+    let trimmed = bytes
+        .iter()
+        .position(|&b| !b.is_ascii_whitespace())
         .map(|p| &bytes[p..])
         .unwrap_or(bytes);
     let first = trimmed.first().copied().unwrap_or(b' ');
@@ -68,7 +70,10 @@ pub fn classify(bytes: &[u8]) -> ContentClass {
     // number, boolean, null, object, or array) — not `[ERROR]` or `[INFO]`.
     if first == b'[' {
         let second = trimmed.get(1).copied().unwrap_or(b' ');
-        if matches!(second, b'"' | b'{' | b'[' | b'n' | b't' | b'f') || second.is_ascii_digit() || second == b'-' {
+        if matches!(second, b'"' | b'{' | b'[' | b'n' | b't' | b'f')
+            || second.is_ascii_digit()
+            || second == b'-'
+        {
             return ContentClass::Json;
         }
     }
@@ -96,7 +101,14 @@ pub fn classify(bytes: &[u8]) -> ContentClass {
     if !non_ws.is_empty() {
         let hex_b64_count = non_ws
             .iter()
-            .filter(|&&b| b.is_ascii_hexdigit() || b == b'+' || b == b'/' || b == b'=' || b == b'_' || b == b'-')
+            .filter(|&&b| {
+                b.is_ascii_hexdigit()
+                    || b == b'+'
+                    || b == b'/'
+                    || b == b'='
+                    || b == b'_'
+                    || b == b'-'
+            })
             .count();
         if hex_b64_count as f64 / non_ws.len() as f64 >= 0.70 {
             return ContentClass::Hex;
@@ -109,9 +121,10 @@ pub fn classify(bytes: &[u8]) -> ContentClass {
 fn has_log_markers(sample: &[u8]) -> bool {
     let s = std::str::from_utf8(sample).unwrap_or("");
     // Common log level markers
-    let level_markers = [" INFO ", " WARN ", " ERROR ", " DEBUG ", " TRACE ", " FATAL ",
-                          "[INFO]", "[WARN]", "[ERROR]", "[DEBUG]", "[TRACE]",
-                          "INFO:", "WARN:", "ERROR:", "DEBUG:"];
+    let level_markers = [
+        " INFO ", " WARN ", " ERROR ", " DEBUG ", " TRACE ", " FATAL ", "[INFO]", "[WARN]",
+        "[ERROR]", "[DEBUG]", "[TRACE]", "INFO:", "WARN:", "ERROR:", "DEBUG:",
+    ];
     for m in &level_markers {
         if s.contains(m) {
             return true;
@@ -141,13 +154,36 @@ fn has_log_markers(sample: &[u8]) -> bool {
 fn has_code_markers(sample: &[u8]) -> bool {
     let s = std::str::from_utf8(sample).unwrap_or("");
     let markers = [
-        "fn ", "pub fn", "async fn", "impl ", "struct ", "enum ", "trait ",  // Rust
-        "def ", "class ", "import ", "from ", "return ",                       // Python/general
-        "function ", "const ", "let ", "var ", "=>",                          // JS/TS
-        "func ", "package ", "type ",                                          // Go
-        "public class", "private ", "protected ",                              // Java/C#
-        "#include", "namespace ", "template<",                                 // C/C++
-        "SELECT ", "FROM ", "WHERE ", "INSERT INTO",                          // SQL
+        "fn ",
+        "pub fn",
+        "async fn",
+        "impl ",
+        "struct ",
+        "enum ",
+        "trait ", // Rust
+        "def ",
+        "class ",
+        "import ",
+        "from ",
+        "return ", // Python/general
+        "function ",
+        "const ",
+        "let ",
+        "var ",
+        "=>", // JS/TS
+        "func ",
+        "package ",
+        "type ", // Go
+        "public class",
+        "private ",
+        "protected ", // Java/C#
+        "#include",
+        "namespace ",
+        "template<", // C/C++
+        "SELECT ",
+        "FROM ",
+        "WHERE ",
+        "INSERT INTO", // SQL
     ];
     for m in &markers {
         if s.contains(m) {
@@ -178,27 +214,73 @@ pub struct ModelPricing {
     pub cache_read_per_mtok: f64,
 }
 
-/// Look up pricing for a model id. Falls back to the `default` entry.
+/// Try loading a pricing entry from the file pointed to by
+/// `PIGGYBANK_PRICING_FILE`. The file must be a JSON object keyed by model id
+/// (or `"default"`), each value an object with `input_per_mtok` and
+/// `cache_read_per_mtok` (both `f64`). Example:
+///
+/// ```json
+/// {
+///   "claude-opus-5": {"input_per_mtok": 15.0, "cache_read_per_mtok": 1.5},
+///   "default":       {"input_per_mtok": 3.0,  "cache_read_per_mtok": 0.3}
+/// }
+/// ```
+///
+/// Returns `None` if the env var is unset, the file is unreadable, the
+/// requested model id is absent, AND there is no `"default"` key in the file.
+fn pricing_from_file(model_id: &str) -> Option<ModelPricing> {
+    let path = std::env::var("PIGGYBANK_PRICING_FILE").ok()?;
+    let raw = std::fs::read_to_string(&path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let entry = v.get(model_id).or_else(|| v.get("default"))?;
+    let input = entry.get("input_per_mtok")?.as_f64()?;
+    let cache = entry.get("cache_read_per_mtok")?.as_f64()?;
+    Some(ModelPricing {
+        input_per_mtok: input,
+        cache_read_per_mtok: cache,
+    })
+}
+
+/// Look up pricing for a model id. Checks `PIGGYBANK_PRICING_FILE` first,
+/// then the built-in table, then falls back to the `default` entry.
 pub fn model_pricing(model_id: &str) -> (&'static str, ModelPricing) {
+    // External override: operators can point PIGGYBANK_PRICING_FILE at a JSON
+    // file with custom rates without rebuilding the binary.
+    if let Some(p) = pricing_from_file(model_id) {
+        return ("file", p);
+    }
+
     // Prices are estimates based on Anthropic's public pricing page patterns.
     // Verify current rates at https://www.anthropic.com/pricing before using
     // for billing decisions.
     let table: &[(&str, ModelPricing)] = &[
         (
             "claude-fable-5-1",
-            ModelPricing { input_per_mtok: 3.00, cache_read_per_mtok: 0.30 },
+            ModelPricing {
+                input_per_mtok: 3.00,
+                cache_read_per_mtok: 0.30,
+            },
         ),
         (
             "claude-opus-5",
-            ModelPricing { input_per_mtok: 15.00, cache_read_per_mtok: 1.50 },
+            ModelPricing {
+                input_per_mtok: 15.00,
+                cache_read_per_mtok: 1.50,
+            },
         ),
         (
             "claude-sonnet-5",
-            ModelPricing { input_per_mtok: 3.00, cache_read_per_mtok: 0.30 },
+            ModelPricing {
+                input_per_mtok: 3.00,
+                cache_read_per_mtok: 0.30,
+            },
         ),
         (
             "claude-haiku-4-5-20251001",
-            ModelPricing { input_per_mtok: 0.80, cache_read_per_mtok: 0.08 },
+            ModelPricing {
+                input_per_mtok: 0.80,
+                cache_read_per_mtok: 0.08,
+            },
         ),
     ];
 
@@ -209,7 +291,13 @@ pub fn model_pricing(model_id: &str) -> (&'static str, ModelPricing) {
     }
 
     // Default: claude-sonnet-5 pricing
-    ("default", ModelPricing { input_per_mtok: 3.00, cache_read_per_mtok: 0.30 })
+    (
+        "default",
+        ModelPricing {
+            input_per_mtok: 3.00,
+            cache_read_per_mtok: 0.30,
+        },
+    )
 }
 
 /// Resolve the model id from the `PIGGYBANK_MODEL` environment variable,
@@ -246,16 +334,28 @@ mod tests {
 
     #[test]
     fn classify_logs_by_level_marker() {
-        assert_eq!(classify(b"2024-01-15 12:00:00 INFO some message"), ContentClass::Logs);
+        assert_eq!(
+            classify(b"2024-01-15 12:00:00 INFO some message"),
+            ContentClass::Logs
+        );
         assert_eq!(classify(b"[ERROR] failed to connect"), ContentClass::Logs);
-        assert_eq!(classify(b"2024-01-15T12:00:00Z WARNING timeout"), ContentClass::Logs);
+        assert_eq!(
+            classify(b"2024-01-15T12:00:00Z WARNING timeout"),
+            ContentClass::Logs
+        );
     }
 
     #[test]
     fn classify_code_by_keywords() {
-        assert_eq!(classify(b"fn main() { println!(\"hello\"); }"), ContentClass::Code);
+        assert_eq!(
+            classify(b"fn main() { println!(\"hello\"); }"),
+            ContentClass::Code
+        );
         assert_eq!(classify(b"def hello():\n    return 42"), ContentClass::Code);
-        assert_eq!(classify(b"public class Foo { private int x; }"), ContentClass::Code);
+        assert_eq!(
+            classify(b"public class Foo { private int x; }"),
+            ContentClass::Code
+        );
     }
 
     #[test]
@@ -308,5 +408,49 @@ mod tests {
         // hex should have the lowest (smallest) ratio = most tokens per byte
         assert!(ContentClass::Hex.bytes_per_token() < ContentClass::Json.bytes_per_token());
         assert!(ContentClass::Json.bytes_per_token() < ContentClass::Prose.bytes_per_token());
+    }
+
+    #[test]
+    fn pricing_file_overrides_builtin() {
+        use std::io::Write;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        write!(
+            f,
+            r#"{{"claude-opus-5":{{"input_per_mtok":99.0,"cache_read_per_mtok":9.9}}}}"#
+        )
+        .unwrap();
+        let path = f.path().to_str().unwrap().to_string();
+        std::env::set_var("PIGGYBANK_PRICING_FILE", &path);
+        let (src, p) = model_pricing("claude-opus-5");
+        std::env::remove_var("PIGGYBANK_PRICING_FILE");
+        assert_eq!(src, "file");
+        assert!((p.input_per_mtok - 99.0).abs() < 0.001);
+        assert!((p.cache_read_per_mtok - 9.9).abs() < 0.001);
+    }
+
+    #[test]
+    fn pricing_file_default_key_used_for_unknown_model() {
+        use std::io::Write;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        write!(
+            f,
+            r#"{{"default":{{"input_per_mtok":5.0,"cache_read_per_mtok":0.5}}}}"#
+        )
+        .unwrap();
+        let path = f.path().to_str().unwrap().to_string();
+        std::env::set_var("PIGGYBANK_PRICING_FILE", &path);
+        let (src, p) = model_pricing("some-future-model");
+        std::env::remove_var("PIGGYBANK_PRICING_FILE");
+        assert_eq!(src, "file");
+        assert!((p.input_per_mtok - 5.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn pricing_file_missing_falls_through_to_builtin() {
+        std::env::set_var("PIGGYBANK_PRICING_FILE", "/nonexistent/path/pricing.json");
+        let (src, p) = model_pricing("claude-haiku-4-5-20251001");
+        std::env::remove_var("PIGGYBANK_PRICING_FILE");
+        assert_eq!(src, "claude-haiku-4-5-20251001");
+        assert!((p.input_per_mtok - 0.80).abs() < 0.001);
     }
 }

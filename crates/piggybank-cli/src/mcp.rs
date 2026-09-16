@@ -778,7 +778,9 @@ fn handle_retrieve(state: &ServerState, args: &Value) -> Result<Value, String> {
         piggybank_core::mask::mask_secrets(&content_str)
     };
 
-    state.metrics.record_retrieve(tool, None, bytes.len() as u64);
+    state
+        .metrics
+        .record_retrieve(tool, None, bytes.len() as u64);
     if masked_count > 0 {
         state.metrics.record_masked(masked_count as u64);
     }
