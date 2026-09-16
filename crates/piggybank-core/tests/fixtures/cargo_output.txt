@@ -1,0 +1,48 @@
+   Compiling proc-macro2 v1.0.69
+   Compiling unicode-ident v1.0.12
+   Compiling quote v1.0.33
+   Compiling syn v2.0.38
+   Compiling serde_derive v1.0.190
+   Compiling serde v1.0.190
+   Compiling version_check v0.9.4
+   Compiling cfg-if v1.0.0
+   Compiling getrandom v0.2.10
+   Compiling rand_core v0.6.4
+   Compiling rand_chacha v0.3.1
+   Compiling rand v0.8.5
+   Compiling hex v0.4.3
+   Compiling block-buffer v0.10.4
+   Compiling crypto-common v0.1.6
+   Compiling generic-array v0.14.7
+   Compiling sha2 v0.10.8
+   Compiling serde_json v1.0.108
+   Compiling my-project v0.1.0 (/home/user/my-project)
+error[E0308]: mismatched types
+  --> src/main.rs:42:18
+   |
+42 |     let x: u32 = "hello";
+   |            ---   ^^^^^^^ expected `u32`, found `&str`
+   |            |
+   |            expected due to this
+
+error[E0382]: borrow of moved value: `data`
+  --> src/lib.rs:87:9
+   |
+85 |     let data = String::from("important data");
+   |         ---- move occurs because `data` has type `String`
+86 |     process(data);
+   |             ---- value moved here
+87 |     println!("{}", data);
+   |                    ^^^^ value borrowed here after move
+
+warning[W0600]: unused variable: `temp`
+  --> src/utils.rs:15:9
+   |
+15 |     let temp = calculate();
+   |         ^^^^ help: if this is intentional, prefix with an underscore: `_temp`
+   |
+   = note: `#[warn(unused_variables)]` on by default
+
+error: aborting due to 2 previous errors; 1 warning emitted
+
+For more information about this error, try `rustc --explain E0308`.

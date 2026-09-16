@@ -607,3 +607,9 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 }
+
+pub mod format;
+pub use format::{compress_with_format, detect_format, Format};
+
+pub mod retrieve;
+pub use retrieve::{apply_retrieve_opts, RetrieveOpts, RetrieveResult};

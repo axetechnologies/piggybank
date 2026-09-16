@@ -1,0 +1,58 @@
+diff --git a/src/main.rs b/src/main.rs
+index 3f5a2c1..8b9d4e7 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1,20 +1,22 @@
+ use std::collections::HashMap;
+ use std::io::{self, BufRead};
++use std::time::Instant;
+
+ fn main() {
+     let stdin = io::stdin();
+-    let mut count = 0;
++    let start = Instant::now();
++    let mut count: u64 = 0;
+
+     for line in stdin.lock().lines() {
+         let line = line.unwrap();
+-        if line.contains("ERROR") {
++        if line.contains("ERROR") || line.contains("FATAL") {
+             count += 1;
+         }
+     }
+
+-    println!("Found {} errors", count);
++    println!("Found {} errors in {:?}", count, start.elapsed());
+ }
+
+ fn helper_function_one() -> bool {
+     true
+ }
+
+ fn helper_function_two() -> String {
+     String::from("unchanged")
+ }
+
+ fn helper_function_three() -> Vec<u8> {
+     vec![1, 2, 3]
+ }
+
+ fn helper_function_four() -> Option<i32> {
+     Some(42)
+ }
+
+ fn helper_function_five() -> Result<(), String> {
+     Ok(())
+ }
+diff --git a/src/lib.rs b/src/lib.rs
+index 1a2b3c4..9e8f7d6 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -5,6 +5,7 @@
+ pub mod utils;
+ pub mod models;
+ pub mod api;
++pub mod metrics;
+
+ pub use models::User;
+ pub use api::Router;

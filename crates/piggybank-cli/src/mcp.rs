@@ -28,7 +28,7 @@
 
 use piggybank_core::harvest;
 use piggybank_core::harvest::{HarvestEvent, Harvester};
-use piggybank_core::{Session, Store, TextOptions};
+use piggybank_core::{apply_retrieve_opts, RetrieveOpts, Session, Store, TextOptions};
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -325,12 +325,13 @@ fn tool_defs() -> Value {
     json!([
         {
             "name": "compress",
-            "description": "Compress content before it reaches an LLM. Auto-detects JSON (lossless columnar compression with recursive value interning: repeated keys/values/subtrees in arrays-of-objects amortized, cross-call content-addressing deduplicates across separate calls) vs text/logs (consecutive and non-consecutive line dedup + middle elision for large blocks, exact recovery via retrieve). Pass `key` (e.g. a file path) to diff against whatever was last compressed under that same key in this session. First-sight keys with no prior version are automatically diffed against other keys' stored content when >33% line overlap is detected (cross-key dedup).",
+            "description": "Compress content before it reaches an LLM. Auto-detects JSON (lossless columnar compression) vs structured text formats vs generic text/logs (dedup + elision). Structured-format compression keeps signal verbatim (errors, failures, warnings, summaries) and collapses noise (progress lines, passing tests, compilation chatter) into counts with elide refs. Supported formats: pytest (collapses PASSED/dot lines, keeps failure tracebacks), cargo (collapses Compiling/passing-test lines, keeps errors/warnings with spans), git-diff (collapses unchanged context to 1-line-per-side summaries), git-status (pass-through, already compact), git-log-oneline (pass-through), package-manager (collapses progress, keeps errors/warnings/summary), jsonl (columnar schema header + batch elision). Pass `format` to override auto-detection. Pass `key` for session-aware diffing.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "content": { "type": "string", "description": "The raw content to compress." },
-                    "key": { "type": "string", "description": "Optional stable identifier (e.g. a file path) for session-aware diffing." }
+                    "key": { "type": "string", "description": "Optional stable identifier (e.g. a file path) for session-aware diffing." },
+                    "format": { "type": "string", "description": "Optional format hint overriding auto-detection. One of: pytest, cargo, git-diff, git-status, git-log-oneline, package-manager, jsonl." }
                 },
                 "required": ["content"]
             }
@@ -359,11 +360,17 @@ fn tool_defs() -> Value {
         },
         {
             "name": "retrieve",
-            "description": "Fetch the exact original bytes behind a reference id embedded in a compressed view (e.g. the id inside a PIGGYBANK:ELIDE:... marker). Nothing compress writes to its store is ever discarded, so this always succeeds for a ref it actually returned. Response includes first_seen_unix - when this exact content first entered the store, by any caller, not just this one (null if written before provenance tracking existed).",
+            "description": "Fetch original bytes behind a reference id (e.g. the id inside a PIGGYBANK:ELIDE:... or BOOMERANG:ELIDE:... marker). To avoid fetching a large blob you don't need, use the optional slice params: lines (e.g. '10-50'), head/tail (first/last N lines), grep (substring or */?-glob) with context (lines around each match), or max_bytes (apply budget elision to the selection). Response always includes total_lines, total_bytes (of the full original), the slice description, and first_seen_unix.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "ref": { "type": "string", "description": "The content-store reference id (sha256 hex)." }
+                    "ref": { "type": "string", "description": "The content-store reference id (sha256 hex)." },
+                    "lines": { "type": "string", "description": "1-based inclusive line range, e.g. '10-50' to return lines 10 through 50." },
+                    "grep": { "type": "string", "description": "Substring or simple */?-glob to filter lines. Returns only matching lines." },
+                    "context": { "type": "integer", "description": "Number of lines before/after each grep match to include (default 0).", "minimum": 0 },
+                    "head": { "type": "integer", "description": "Return only the first N lines.", "minimum": 1 },
+                    "tail": { "type": "integer", "description": "Return only the last N lines.", "minimum": 1 },
+                    "max_bytes": { "type": "integer", "description": "If the slice exceeds this byte count, apply anomaly-ranked elision. Elided parts remain stored and retrievable.", "minimum": 1 }
                 },
                 "required": ["ref"]
             }
@@ -382,12 +389,13 @@ fn tool_defs() -> Value {
         },
         {
             "name": "compress_budget",
-            "description": "Budget-constrained compression: 'I have N bytes of context budget — give me the highest information density you can fit.' Compresses content with a hard byte ceiling. If normal compression already fits, returns that. Otherwise uses anomaly-ranked selection: lines are scored by importance (errors, warnings, failures, stack traces score highest) and the most informative lines are kept while gaps are replaced with ELIDE markers (stored for recovery via retrieve). Elided content is never lost — retrieve any reference id to get the exact original bytes back. Use when context window space is scarce and you need the most important parts of large output.",
+            "description": "Budget-constrained compression: 'I have N bytes of context budget — give me the highest information density you can fit.' Applies format-aware compression first (if the format is detected or hinted), then anomaly-ranked elision to hit the byte ceiling. Elided content is always stored — retrieve any ref id to get the exact original bytes back. Pass `format` to override auto-detection.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "content": { "type": "string", "description": "The raw content to compress." },
-                    "max_bytes": { "type": "integer", "description": "Maximum byte size for the compressed view.", "minimum": 1 }
+                    "max_bytes": { "type": "integer", "description": "Maximum byte size for the compressed view.", "minimum": 1 },
+                    "format": { "type": "string", "description": "Optional format hint. One of: pytest, cargo, git-diff, git-status, git-log-oneline, package-manager, jsonl." }
                 },
                 "required": ["content", "max_bytes"]
             }
@@ -472,24 +480,70 @@ fn record_and_savings(state: &ServerState, original: usize, compressed: usize) -
     r
 }
 
+fn parse_format_hint(hint: Option<&str>) -> Option<piggybank_core::Format> {
+    match hint? {
+        "pytest" => Some(piggybank_core::Format::Pytest),
+        "cargo" => Some(piggybank_core::Format::Cargo),
+        "git-diff" => Some(piggybank_core::Format::GitDiff),
+        "git-status" => Some(piggybank_core::Format::GitStatus),
+        "git-log-oneline" => Some(piggybank_core::Format::GitLogOneline),
+        "package-manager" => Some(piggybank_core::Format::PackageManager),
+        "jsonl" => Some(piggybank_core::Format::JsonLines),
+        _ => None,
+    }
+}
+
+fn detect_or_hint_format(content: &str, hint: Option<&str>) -> Option<piggybank_core::Format> {
+    parse_format_hint(hint).or_else(|| piggybank_core::detect_format(content))
+}
+
 fn handle_compress(state: &ServerState, args: &Value) -> Result<Value, String> {
     let content = args
         .get("content")
         .and_then(Value::as_str)
         .ok_or("missing 'content' argument")?;
     let key = args.get("key").and_then(Value::as_str);
+    let format_hint = args.get("format").and_then(Value::as_str);
 
-    // The store-backed variant: JSON gets the same cross-call memory text
-    // already has via Session, but content-addressed rather than
-    // key-addressed - a repeated large value (a status endpoint's payload,
-    // a metadata object re-fetched unchanged) collapses to near-nothing the
-    // moment it's seen again, in ANY later call, not just under one key.
-    if let Ok(compressed) =
-        piggybank_core::compress_json_with_store(content.as_bytes(), &state.store)
-    {
-        if let Some(k) = key {
-            state.session.record_content_hash(k, content.as_bytes());
+    // JSON: lossless columnar, cross-call content-addressing.
+    // Skip JSON check when a text format is explicitly hinted.
+    if format_hint.is_none() {
+        if let Ok(compressed) =
+            piggybank_core::compress_json_with_store(content.as_bytes(), &state.store)
+        {
+            if let Some(k) = key {
+                state.session.record_content_hash(k, content.as_bytes());
+            }
+            let ratio = if !content.is_empty() {
+                compressed.len() as f64 / content.len() as f64
+            } else {
+                1.0
+            };
+            state.harvester.log(HarvestEvent::Compress {
+                ts: harvest::now(),
+                session_id: state.harvester.session_id().to_string(),
+                key: key.map(|s| s.to_string()),
+                original_bytes: content.len(),
+                compressed_bytes: compressed.len(),
+                ratio,
+                content_type: "json".to_string(),
+            });
+            let savings = record_and_savings(state, content.len(), compressed.len());
+            return Ok(json!({
+                "view": encode_view("json", &compressed),
+                "original_bytes": content.len(),
+                "compressed_bytes": compressed.len(),
+                "savings": savings,
+            }));
         }
+    }
+
+    // Format-aware structured text compression.
+    if let Some(fmt) = detect_or_hint_format(content, format_hint) {
+        let compressed =
+            piggybank_core::compress_with_format(&state.store, content.as_bytes(), fmt)
+                .map_err(|e| e.to_string())?;
+        let fmt_name = format!("{fmt:?}").to_ascii_lowercase();
         let ratio = if !content.is_empty() {
             compressed.len() as f64 / content.len() as f64
         } else {
@@ -502,13 +556,14 @@ fn handle_compress(state: &ServerState, args: &Value) -> Result<Value, String> {
             original_bytes: content.len(),
             compressed_bytes: compressed.len(),
             ratio,
-            content_type: "json".to_string(),
+            content_type: fmt_name.clone(),
         });
         let savings = record_and_savings(state, content.len(), compressed.len());
         return Ok(json!({
-            "view": encode_view("json", &compressed),
+            "view": encode_view("text", &compressed),
             "original_bytes": content.len(),
             "compressed_bytes": compressed.len(),
+            "format_detected": fmt_name,
             "savings": savings,
         }));
     }
@@ -627,13 +682,49 @@ fn handle_retrieve(state: &ServerState, args: &Value) -> Result<Value, String> {
         .and_then(Value::as_str)
         .ok_or("missing 'ref' argument")?;
     let bytes = state.store.get(reference).map_err(|e| e.to_string())?;
-    // Best-effort provenance: when this content first entered the store,
-    // Unix seconds, however it got there (this caller or another one
-    // entirely sharing the same store - see the cross-call memory tests).
-    // Missing for content written before provenance tracking existed;
-    // never fails the retrieve itself.
     let first_seen_unix = state.store.first_seen(reference).ok().flatten();
-    Ok(json!({ "content": String::from_utf8_lossy(&bytes), "first_seen_unix": first_seen_unix }))
+
+    // Parse optional slice params.
+    let lines_range = args.get("lines").and_then(Value::as_str).and_then(|s| {
+        let (a, b) = s.split_once('-')?;
+        Some((
+            a.trim().parse::<usize>().ok()?,
+            b.trim().parse::<usize>().ok()?,
+        ))
+    });
+    let grep = args.get("grep").and_then(Value::as_str).map(str::to_string);
+    let context = args.get("context").and_then(Value::as_u64).unwrap_or(0) as usize;
+    let head = args.get("head").and_then(Value::as_u64).map(|n| n as usize);
+    let tail = args.get("tail").and_then(Value::as_u64).map(|n| n as usize);
+    let max_bytes = args
+        .get("max_bytes")
+        .and_then(Value::as_u64)
+        .map(|n| n as usize);
+
+    let opts = RetrieveOpts {
+        lines: lines_range,
+        grep,
+        context,
+        head,
+        tail,
+        max_bytes,
+    };
+
+    let store_ref = if max_bytes.is_some() {
+        Some(&state.store)
+    } else {
+        None
+    };
+
+    let result = apply_retrieve_opts(&bytes, &opts, store_ref).map_err(|e| e.to_string())?;
+
+    Ok(json!({
+        "content": String::from_utf8_lossy(&result.content),
+        "total_lines": result.total_lines,
+        "total_bytes": result.total_bytes,
+        "slice": result.slice_description,
+        "first_seen_unix": first_seen_unix,
+    }))
 }
 
 fn handle_compress_budget(state: &ServerState, args: &Value) -> Result<Value, String> {
@@ -648,20 +739,37 @@ fn handle_compress_budget(state: &ServerState, args: &Value) -> Result<Value, St
     if max_bytes == 0 {
         return Err("max_bytes must be >= 1".into());
     }
-    let compressed =
-        piggybank_core::compress_text_budget(&state.store, content.as_bytes(), max_bytes)
-            .map_err(|e| e.to_string())?;
+    let format_hint = args.get("format").and_then(Value::as_str);
+
+    // Apply format-aware compression first; then budget-elision on the result.
+    let pre_compressed = if let Some(fmt) = detect_or_hint_format(content, format_hint) {
+        piggybank_core::compress_with_format(&state.store, content.as_bytes(), fmt)
+            .map_err(|e| e.to_string())?
+    } else {
+        content.as_bytes().to_vec()
+    };
+
+    let compressed = if pre_compressed.len() <= max_bytes {
+        pre_compressed
+    } else {
+        piggybank_core::compress_text_budget(&state.store, &pre_compressed, max_bytes)
+            .map_err(|e| e.to_string())?
+    };
+
     let within_budget = compressed.len() <= max_bytes;
     let normal_would_exceed = content.len() > max_bytes;
     if normal_would_exceed && within_budget {
         state.budget_enforcements.fetch_add(1, Relaxed);
     }
+    let fmt_detected =
+        detect_or_hint_format(content, format_hint).map(|f| format!("{f:?}").to_ascii_lowercase());
     let savings = record_and_savings(state, content.len(), compressed.len());
     Ok(json!({
         "view": encode_view("text", &compressed),
         "original_bytes": content.len(),
         "compressed_bytes": compressed.len(),
         "within_budget": within_budget,
+        "format_detected": fmt_detected,
         "savings": savings,
     }))
 }

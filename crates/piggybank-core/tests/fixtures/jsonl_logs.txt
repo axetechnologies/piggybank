@@ -1,0 +1,16 @@
+{"ts":"2024-01-15T10:00:01Z","level":"INFO","msg":"request received","path":"/api/health","method":"GET","status":200,"latency_ms":3}
+{"ts":"2024-01-15T10:00:02Z","level":"INFO","msg":"request received","path":"/api/users","method":"GET","status":200,"latency_ms":8}
+{"ts":"2024-01-15T10:00:03Z","level":"INFO","msg":"request received","path":"/api/users/42","method":"GET","status":200,"latency_ms":12}
+{"ts":"2024-01-15T10:00:04Z","level":"INFO","msg":"request received","path":"/api/orders","method":"GET","status":200,"latency_ms":5}
+{"ts":"2024-01-15T10:00:05Z","level":"INFO","msg":"request received","path":"/api/orders","method":"POST","status":201,"latency_ms":45}
+{"ts":"2024-01-15T10:00:06Z","level":"ERROR","msg":"request received","path":"/api/orders","method":"POST","status":500,"latency_ms":30042}
+{"ts":"2024-01-15T10:00:07Z","level":"INFO","msg":"request received","path":"/api/health","method":"GET","status":200,"latency_ms":2}
+{"ts":"2024-01-15T10:00:08Z","level":"INFO","msg":"request received","path":"/api/health","method":"GET","status":200,"latency_ms":3}
+{"ts":"2024-01-15T10:00:09Z","level":"INFO","msg":"request received","path":"/api/health","method":"GET","status":200,"latency_ms":2}
+{"ts":"2024-01-15T10:00:10Z","level":"INFO","msg":"request received","path":"/api/health","method":"GET","status":200,"latency_ms":4}
+{"ts":"2024-01-15T10:00:11Z","level":"INFO","msg":"request received","path":"/api/health","method":"GET","status":200,"latency_ms":2}
+{"ts":"2024-01-15T10:00:12Z","level":"INFO","msg":"request received","path":"/api/health","method":"GET","status":200,"latency_ms":3}
+{"ts":"2024-01-15T10:00:13Z","level":"INFO","msg":"request received","path":"/api/health","method":"GET","status":200,"latency_ms":2}
+{"ts":"2024-01-15T10:00:14Z","level":"INFO","msg":"request received","path":"/api/health","method":"GET","status":200,"latency_ms":4}
+{"ts":"2024-01-15T10:00:15Z","level":"INFO","msg":"request received","path":"/api/health","method":"GET","status":200,"latency_ms":3}
+{"ts":"2024-01-15T10:00:16Z","level":"INFO","msg":"request received","path":"/api/health","method":"GET","status":200,"latency_ms":2}

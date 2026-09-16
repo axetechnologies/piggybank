@@ -1,0 +1,72 @@
+============================= test session starts ==============================
+platform linux -- Python 3.11.5, pytest-7.4.2, pluggy-1.3.0
+rootdir: /home/user/project
+collected 42 items
+
+tests/test_api.py::test_health_check PASSED                              [  2%]
+tests/test_api.py::test_auth_login PASSED                                [  4%]
+tests/test_api.py::test_auth_logout PASSED                               [  7%]
+tests/test_api.py::test_get_user PASSED                                  [  9%]
+tests/test_api.py::test_create_user PASSED                               [ 11%]
+tests/test_api.py::test_update_user PASSED                               [ 14%]
+tests/test_api.py::test_delete_user PASSED                               [ 16%]
+tests/test_models.py::test_user_model_valid PASSED                       [ 19%]
+tests/test_models.py::test_user_model_invalid_email PASSED               [ 21%]
+tests/test_models.py::test_user_model_missing_field FAILED               [ 23%]
+tests/test_models.py::test_product_model PASSED                          [ 26%]
+tests/test_models.py::test_order_model PASSED                            [ 28%]
+tests/test_db.py::test_connection PASSED                                 [ 30%]
+tests/test_db.py::test_insert PASSED                                     [ 33%]
+tests/test_db.py::test_query PASSED                                      [ 35%]
+tests/test_db.py::test_transaction_rollback PASSED                       [ 38%]
+tests/test_db.py::test_constraint_violation FAILED                       [ 40%]
+tests/test_cache.py::test_set_get PASSED                                 [ 42%]
+tests/test_cache.py::test_ttl_expiry PASSED                              [ 45%]
+tests/test_cache.py::test_eviction PASSED                                [ 47%]
+tests/test_cache.py::test_concurrent_access PASSED                       [ 50%]
+tests/test_utils.py::test_parse_date PASSED                              [ 52%]
+tests/test_utils.py::test_format_currency PASSED                         [ 54%]
+tests/test_utils.py::test_slugify PASSED                                 [ 57%]
+tests/test_utils.py::test_validate_email PASSED                          [ 59%]
+tests/test_utils.py::test_validate_phone PASSED                          [ 61%]
+tests/test_integration.py::test_end_to_end_checkout PASSED               [ 64%]
+tests/test_integration.py::test_payment_flow PASSED                      [ 66%]
+tests/test_integration.py::test_refund_flow PASSED                       [ 69%]
+
+FAILED tests/test_models.py::test_user_model_missing_field - AssertionError: ValidationError not raised
+FAILED tests/test_db.py::test_constraint_violation - IntegrityError: UNIQUE constraint failed: users.email
+
+=================================== FAILURES ===================================
+_______ test_user_model_missing_field _______
+
+    def test_user_model_missing_field():
+        data = {"email": "user@example.com"}
+>       user = UserModel(**data)
+E       AssertionError: ValidationError not raised
+E       Expected: UserModel(**data) raises ValidationError
+E       Got: UserModel(email='user@example.com', name=None)
+
+tests/test_models.py:47: AssertionError
+
+_______ test_constraint_violation _______
+
+    def test_constraint_violation():
+        db.insert(User(email="dup@test.com"))
+>       db.insert(User(email="dup@test.com"))
+E       IntegrityError: UNIQUE constraint failed: users.email
+
+tests/test_db.py:89: IntegrityError
+During handling of the above exception, another exception occurred:
+
+    def test_constraint_violation():
+        db.insert(User(email="dup@test.com"))
+        db.insert(User(email="dup@test.com"))
+>       assert raised_integrity_error
+E       AssertionError: expected IntegrityError to be caught by context manager
+
+tests/test_db.py:93: AssertionError
+
+=========================== short test summary info ============================
+FAILED tests/test_models.py::test_user_model_missing_field - AssertionError: ValidationError not raised
+FAILED tests/test_db.py::test_constraint_violation - AssertionError: expected IntegrityError to be caught
+============================== 2 failed, 27 passed in 3.45s ==============================
