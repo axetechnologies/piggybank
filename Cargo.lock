@@ -10,7 +10,7 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
 name = "axelrod-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde_json",
  "ureq",
@@ -358,15 +358,16 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "piggybank-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "piggybank-core",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
 name = "piggybank-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "hex",
  "proptest",
