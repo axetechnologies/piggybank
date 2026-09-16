@@ -5,15 +5,14 @@
 //! - `hook-savings.jsonl` — per-rewrite `{"d":"YYYY-MM-DD","saved":N,...}` lines
 //!   appended by the PostToolUse hook
 //!
-//! Token and dollar figures use the same byte-based heuristic as the MCP stats path;
-//! keep these constants in sync with `mcp.rs` until a real tokenizer lands.
+//! Token and dollar figures use the content-class-aware estimator from
+//! `piggybank_core::token_est`. Pass `--model <id>` or set `PIGGYBANK_MODEL`
+//! to select a pricing tier.
 
+use piggybank_core::token_est::{ContentClass, model_from_env, model_pricing, tokens_from_bytes};
 use serde_json::Value;
 use std::path::Path;
 use std::process::ExitCode;
-
-const BYTES_PER_TOKEN: f64 = 4.0;
-const DEFAULT_RATE_PER_MTOK: f64 = 3.0;
 
 #[derive(Debug, Default, PartialEq)]
 pub struct SavingsStats {
@@ -22,12 +21,20 @@ pub struct SavingsStats {
 }
 
 impl SavingsStats {
+    /// Estimate tokens for a byte count (prose class, conservative).
     pub fn tokens(bytes: u64) -> f64 {
-        bytes as f64 / BYTES_PER_TOKEN
+        tokens_from_bytes(bytes, ContentClass::Prose)
     }
 
+    /// Estimate USD saved at the current model's input rate.
     pub fn dollars(bytes: u64) -> f64 {
-        Self::tokens(bytes) / 1_000_000.0 * DEFAULT_RATE_PER_MTOK
+        Self::dollars_for_model(bytes, &model_from_env())
+    }
+
+    pub fn dollars_for_model(bytes: u64, model_id: &str) -> f64 {
+        let tokens = Self::tokens(bytes);
+        let (_, pricing) = model_pricing(model_id);
+        tokens / 1_000_000.0 * pricing.input_per_mtok
     }
 }
 
@@ -110,6 +117,17 @@ pub fn run_statusline(args: &[String]) -> ExitCode {
         .unwrap_or_else(|| ".piggybank-store".to_string());
     let plain = args.iter().any(|a| a == "--plain");
 
+    // --model <id> overrides PIGGYBANK_MODEL env for this invocation.
+    if let Some(model_id) = args
+        .iter()
+        .position(|a| a == "--model")
+        .and_then(|i| args.get(i + 1).cloned())
+    {
+        // Temporarily set the env var so SavingsStats::dollars() picks it up.
+        // Safe for a short-lived CLI process (no threads at this point).
+        std::env::set_var("PIGGYBANK_MODEL", &model_id);
+    }
+
     let stats = compute_stats(Path::new(&store_dir), &today_string());
     println!("{}", render(&stats, plain));
     ExitCode::SUCCESS
@@ -173,13 +191,15 @@ mod tests {
 
     #[test]
     fn render_formats_scales() {
+        // 3_300_000 bytes / 3.3 bytes-per-token = 1.0M tokens
+        // 3_300 bytes / 3.3 bytes-per-token = 1.0k tokens
         let stats = SavingsStats {
-            lifetime_bytes: 8_000_000, // 2.0M tokens
-            today_bytes: 8_000,        // 2.0k tokens
+            lifetime_bytes: 3_300_000,
+            today_bytes: 3_300,
         };
         let line = render(&stats, true);
-        assert!(line.contains("today 2.0k tok"), "{line}");
-        assert!(line.contains("lifetime 2.0M tok"), "{line}");
+        assert!(line.contains("today 1.0k tok"), "{line}");
+        assert!(line.contains("lifetime 1.0M tok"), "{line}");
         assert!(line.starts_with("pb "), "{line}");
     }
 }

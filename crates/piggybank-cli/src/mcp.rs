@@ -26,6 +26,7 @@
 //!   only the delta. Designed for tailing logs or polling builds.
 //! - `stats` — entry count and total bytes held in the store.
 
+use crate::metrics::MetricsStore;
 use piggybank_core::harvest;
 use piggybank_core::harvest::{HarvestEvent, Harvester};
 use piggybank_core::{apply_retrieve_opts, RetrieveOpts, Session, Store, TextOptions};
@@ -63,8 +64,15 @@ fn decode_view(view: &str) -> Result<(&str, &str), String> {
     Ok((parts[2], body))
 }
 
-const BYTES_PER_TOKEN: f64 = 4.0;
-const DEFAULT_RATE_PER_MTOK: f64 = 3.0;
+/// Apply secret masking to a compressed view string. Masks the body (after
+/// the BOOM header) while leaving the header intact.
+fn mask_view(view: &str) -> (String, usize) {
+    let body_start = view.find('\n').map(|p| p + 1).unwrap_or(0);
+    let header = &view[..body_start];
+    let body = &view[body_start..];
+    let (masked_body, count) = piggybank_core::mask::mask_secrets(body);
+    (format!("{header}{masked_body}"), count)
+}
 
 struct ServerState {
     store: Store,
@@ -79,6 +87,7 @@ struct ServerState {
     hostname: String,
     last_reported_calls: AtomicU64,
     harvester: Harvester,
+    metrics: MetricsStore,
 }
 
 impl ServerState {
@@ -122,8 +131,13 @@ impl ServerState {
         let saved = tot_orig.saturating_sub(tot_comp);
         let append_avoided = self.append_bytes_avoided.load(Relaxed);
         let total_bytes_saved = saved + append_avoided;
-        let tokens_saved = total_bytes_saved as f64 / BYTES_PER_TOKEN;
-        let cost_saved = tokens_saved * DEFAULT_RATE_PER_MTOK / 1_000_000.0;
+        let model_id = piggybank_core::token_est::model_from_env();
+        let (_, pricing) = piggybank_core::token_est::model_pricing(&model_id);
+        let tokens_saved = piggybank_core::token_est::tokens_from_bytes(
+            total_bytes_saved,
+            piggybank_core::token_est::ContentClass::Prose,
+        );
+        let cost_saved = tokens_saved / 1_000_000.0 * pricing.input_per_mtok;
         let calls = self.compress_calls.load(Relaxed);
         let pct = if tot_orig > 0 {
             (saved as f64 / tot_orig as f64) * 100.0
@@ -250,6 +264,7 @@ pub fn serve(
         hostname,
         last_reported_calls: AtomicU64::new(0),
         harvester,
+        metrics: MetricsStore::open(store_dir),
     };
 
     let stdin = io::stdin();
@@ -325,13 +340,14 @@ fn tool_defs() -> Value {
     json!([
         {
             "name": "compress",
-            "description": "Compress content before it reaches an LLM. Auto-detects JSON (lossless columnar compression) vs structured text formats vs generic text/logs (dedup + elision). Structured-format compression keeps signal verbatim (errors, failures, warnings, summaries) and collapses noise (progress lines, passing tests, compilation chatter) into counts with elide refs. Supported formats: pytest (collapses PASSED/dot lines, keeps failure tracebacks), cargo (collapses Compiling/passing-test lines, keeps errors/warnings with spans), git-diff (collapses unchanged context to 1-line-per-side summaries), git-status (pass-through, already compact), git-log-oneline (pass-through), package-manager (collapses progress, keeps errors/warnings/summary), jsonl (columnar schema header + batch elision). Pass `format` to override auto-detection. Pass `key` for session-aware diffing.",
+            "description": "Compress content before it reaches an LLM. Auto-detects JSON (lossless columnar compression) vs structured text formats vs generic text/logs (dedup + elision). Structured-format compression keeps signal verbatim (errors, failures, warnings, summaries) and collapses noise (progress lines, passing tests, compilation chatter) into counts with elide refs. Supported formats: pytest, cargo, git-diff, git-status, git-log-oneline, package-manager, jsonl. Pass `format` to override auto-detection. Pass `key` for session-aware diffing. Secrets in the view are masked before returning; use `retrieve` with `unmask: true` to recover originals.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "content": { "type": "string", "description": "The raw content to compress." },
                     "key": { "type": "string", "description": "Optional stable identifier (e.g. a file path) for session-aware diffing." },
-                    "format": { "type": "string", "description": "Optional format hint overriding auto-detection. One of: pytest, cargo, git-diff, git-status, git-log-oneline, package-manager, jsonl." }
+                    "format": { "type": "string", "description": "Optional format hint overriding auto-detection. One of: pytest, cargo, git-diff, git-status, git-log-oneline, package-manager, jsonl." },
+                    "tool": { "type": "string", "description": "Optional name of the tool whose output is being compressed (e.g. 'Bash', 'Read'). Used for retrieve-rate analytics and adaptive thresholds." }
                 },
                 "required": ["content"]
             }
@@ -360,7 +376,7 @@ fn tool_defs() -> Value {
         },
         {
             "name": "retrieve",
-            "description": "Fetch original bytes behind a reference id (e.g. the id inside a PIGGYBANK:ELIDE:... or BOOMERANG:ELIDE:... marker). To avoid fetching a large blob you don't need, use the optional slice params: lines (e.g. '10-50'), head/tail (first/last N lines), grep (substring or */?-glob) with context (lines around each match), or max_bytes (apply budget elision to the selection). Response always includes total_lines, total_bytes (of the full original), the slice description, and first_seen_unix.",
+            "description": "Fetch original bytes behind a reference id (e.g. the id inside a PIGGYBANK:ELIDE:... or BOOMERANG:ELIDE:... marker). To avoid fetching a large blob you don't need, use the optional slice params: lines (e.g. '10-50'), head/tail (first/last N lines), grep (substring or */?-glob) with context (lines around each match), or max_bytes (apply budget elision to the selection). Response always includes total_lines, total_bytes (of the full original), the slice description, and first_seen_unix. Secrets are masked by default; pass `unmask: true` to receive original content.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -370,7 +386,9 @@ fn tool_defs() -> Value {
                     "context": { "type": "integer", "description": "Number of lines before/after each grep match to include (default 0).", "minimum": 0 },
                     "head": { "type": "integer", "description": "Return only the first N lines.", "minimum": 1 },
                     "tail": { "type": "integer", "description": "Return only the last N lines.", "minimum": 1 },
-                    "max_bytes": { "type": "integer", "description": "If the slice exceeds this byte count, apply anomaly-ranked elision. Elided parts remain stored and retrievable.", "minimum": 1 }
+                    "max_bytes": { "type": "integer", "description": "If the slice exceeds this byte count, apply anomaly-ranked elision. Elided parts remain stored and retrievable.", "minimum": 1 },
+                    "unmask": { "type": "boolean", "description": "If true, return the original content without secret masking. Default false." },
+                    "tool": { "type": "string", "description": "Optional tool name for retrieve-rate analytics." }
                 },
                 "required": ["ref"]
             }
@@ -389,13 +407,14 @@ fn tool_defs() -> Value {
         },
         {
             "name": "compress_budget",
-            "description": "Budget-constrained compression: 'I have N bytes of context budget — give me the highest information density you can fit.' Applies format-aware compression first (if the format is detected or hinted), then anomaly-ranked elision to hit the byte ceiling. Elided content is always stored — retrieve any ref id to get the exact original bytes back. Pass `format` to override auto-detection.",
+            "description": "Budget-constrained compression: 'I have N bytes of context budget — give me the highest information density you can fit.' Applies format-aware compression first (if the format is detected or hinted), then anomaly-ranked elision to hit the byte ceiling. Elided content is always stored — retrieve any ref id to get the exact original bytes back. Pass `format` to override auto-detection. Secrets in the view are masked before returning.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "content": { "type": "string", "description": "The raw content to compress." },
                     "max_bytes": { "type": "integer", "description": "Maximum byte size for the compressed view.", "minimum": 1 },
-                    "format": { "type": "string", "description": "Optional format hint. One of: pytest, cargo, git-diff, git-status, git-log-oneline, package-manager, jsonl." }
+                    "format": { "type": "string", "description": "Optional format hint. One of: pytest, cargo, git-diff, git-status, git-log-oneline, package-manager, jsonl." },
+                    "tool": { "type": "string", "description": "Optional tool name for retrieve-rate analytics and adaptive min_bytes lookup." }
                 },
                 "required": ["content", "max_bytes"]
             }
@@ -414,8 +433,13 @@ fn tool_defs() -> Value {
         },
         {
             "name": "stats",
-            "description": "Report store size and lifetime compression savings: total calls, bytes in, bytes out, bytes saved, and savings percentage since activation.",
-            "inputSchema": { "type": "object", "properties": {} }
+            "description": "Report store size and lifetime compression savings: total calls, bytes in, bytes out, bytes saved, savings percentage, token savings with model-aware pricing, retrieve-rate breakdown by tool and by key, and total masked secret count.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "model": { "type": "string", "description": "Model id for pricing calculation (e.g. 'claude-fable-5-1', 'claude-opus-5', 'claude-haiku-4-5-20251001'). Overrides PIGGYBANK_MODEL env. Defaults to 'default' (sonnet-5 pricing)." }
+                }
+            }
         },
     ])
 }
@@ -433,7 +457,7 @@ fn handle_tools_call(state: &ServerState, id: Value, request: &Value) -> Value {
         "compress_budget" => handle_compress_budget(state, &arguments),
         "changed" => handle_changed(state, &arguments),
         "compress_append" => handle_compress_append(state, &arguments),
-        "stats" => handle_stats(state),
+        "stats" => handle_stats(state, &arguments),
         other => Err(format!("unknown tool: {other}")),
     };
 
@@ -504,6 +528,7 @@ fn handle_compress(state: &ServerState, args: &Value) -> Result<Value, String> {
         .ok_or("missing 'content' argument")?;
     let key = args.get("key").and_then(Value::as_str);
     let format_hint = args.get("format").and_then(Value::as_str);
+    let tool = args.get("tool").and_then(Value::as_str);
 
     // JSON: lossless columnar, cross-call content-addressing.
     // Skip JSON check when a text format is explicitly hinted.
@@ -529,10 +554,18 @@ fn handle_compress(state: &ServerState, args: &Value) -> Result<Value, String> {
                 content_type: "json".to_string(),
             });
             let savings = record_and_savings(state, content.len(), compressed.len());
+            let view = encode_view("json", &compressed);
+            let (masked_view, masked_count) = mask_view(&view);
+            let bytes_saved = content.len() as i64 - compressed.len() as i64;
+            state.metrics.record_compress(tool, key, bytes_saved);
+            if masked_count > 0 {
+                state.metrics.record_masked(masked_count as u64);
+            }
             return Ok(json!({
-                "view": encode_view("json", &compressed),
+                "view": masked_view,
                 "original_bytes": content.len(),
                 "compressed_bytes": compressed.len(),
+                "masked_count": masked_count,
                 "savings": savings,
             }));
         }
@@ -559,11 +592,19 @@ fn handle_compress(state: &ServerState, args: &Value) -> Result<Value, String> {
             content_type: fmt_name.clone(),
         });
         let savings = record_and_savings(state, content.len(), compressed.len());
+        let view = encode_view("text", &compressed);
+        let (masked_view, masked_count) = mask_view(&view);
+        let bytes_saved = content.len() as i64 - compressed.len() as i64;
+        state.metrics.record_compress(tool, key, bytes_saved);
+        if masked_count > 0 {
+            state.metrics.record_masked(masked_count as u64);
+        }
         return Ok(json!({
-            "view": encode_view("text", &compressed),
+            "view": masked_view,
             "original_bytes": content.len(),
             "compressed_bytes": compressed.len(),
             "format_detected": fmt_name,
+            "masked_count": masked_count,
             "savings": savings,
         }));
     }
@@ -602,10 +643,18 @@ fn handle_compress(state: &ServerState, args: &Value) -> Result<Value, String> {
         content_type: kind.to_string(),
     });
     let savings = record_and_savings(state, content.len(), compressed.len());
+    let view = encode_view(kind, &compressed);
+    let (masked_view, masked_count) = mask_view(&view);
+    let bytes_saved = content.len() as i64 - compressed.len() as i64;
+    state.metrics.record_compress(tool, key, bytes_saved);
+    if masked_count > 0 {
+        state.metrics.record_masked(masked_count as u64);
+    }
     Ok(json!({
-        "view": encode_view(kind, &compressed),
+        "view": masked_view,
         "original_bytes": content.len(),
         "compressed_bytes": compressed.len(),
+        "masked_count": masked_count,
         "savings": savings,
     }))
 }
@@ -681,6 +730,9 @@ fn handle_retrieve(state: &ServerState, args: &Value) -> Result<Value, String> {
         .get("ref")
         .and_then(Value::as_str)
         .ok_or("missing 'ref' argument")?;
+    let unmask = args.get("unmask").and_then(Value::as_bool).unwrap_or(false);
+    let tool = args.get("tool").and_then(Value::as_str);
+
     let bytes = state.store.get(reference).map_err(|e| e.to_string())?;
     let first_seen_unix = state.store.first_seen(reference).ok().flatten();
 
@@ -718,12 +770,26 @@ fn handle_retrieve(state: &ServerState, args: &Value) -> Result<Value, String> {
 
     let result = apply_retrieve_opts(&bytes, &opts, store_ref).map_err(|e| e.to_string())?;
 
+    // Apply secret masking to the retrieved content.
+    let content_str = String::from_utf8_lossy(&result.content);
+    let (content, masked_count) = if unmask {
+        (content_str.into_owned(), 0)
+    } else {
+        piggybank_core::mask::mask_secrets(&content_str)
+    };
+
+    state.metrics.record_retrieve(tool, None, bytes.len() as u64);
+    if masked_count > 0 {
+        state.metrics.record_masked(masked_count as u64);
+    }
+
     Ok(json!({
-        "content": String::from_utf8_lossy(&result.content),
+        "content": content,
         "total_lines": result.total_lines,
         "total_bytes": result.total_bytes,
         "slice": result.slice_description,
         "first_seen_unix": first_seen_unix,
+        "masked_count": masked_count,
     }))
 }
 
@@ -732,14 +798,31 @@ fn handle_compress_budget(state: &ServerState, args: &Value) -> Result<Value, St
         .get("content")
         .and_then(Value::as_str)
         .ok_or("missing 'content' argument")?;
-    let max_bytes = args
+    let tool = args.get("tool").and_then(Value::as_str);
+    let format_hint = args.get("format").and_then(Value::as_str);
+
+    // Honour adaptive suggested_min_bytes: if the caller passes a tool hint
+    // and that tool's recent retrieve_rate is elevated, apply the higher floor.
+    let adaptive_floor = tool
+        .map(|t| state.metrics.suggested_min_bytes(t))
+        .unwrap_or(0);
+
+    let requested_max = args
         .get("max_bytes")
         .and_then(Value::as_u64)
         .ok_or("missing or invalid 'max_bytes' argument")? as usize;
-    if max_bytes == 0 {
+    if requested_max == 0 {
         return Err("max_bytes must be >= 1".into());
     }
-    let format_hint = args.get("format").and_then(Value::as_str);
+
+    // If the content is already below the adaptive floor, compress normally
+    // without forcing a budget limit — eliding aggressively is counterproductive
+    // when retrieves are frequent.
+    let effective_max = if adaptive_floor > 0 && content.len() < adaptive_floor {
+        content.len().max(1)
+    } else {
+        requested_max
+    };
 
     // Apply format-aware compression first; then budget-elision on the result.
     let pre_compressed = if let Some(fmt) = detect_or_hint_format(content, format_hint) {
@@ -749,27 +832,36 @@ fn handle_compress_budget(state: &ServerState, args: &Value) -> Result<Value, St
         content.as_bytes().to_vec()
     };
 
-    let compressed = if pre_compressed.len() <= max_bytes {
+    let compressed = if pre_compressed.len() <= effective_max {
         pre_compressed
     } else {
-        piggybank_core::compress_text_budget(&state.store, &pre_compressed, max_bytes)
+        piggybank_core::compress_text_budget(&state.store, &pre_compressed, effective_max)
             .map_err(|e| e.to_string())?
     };
 
-    let within_budget = compressed.len() <= max_bytes;
-    let normal_would_exceed = content.len() > max_bytes;
+    let within_budget = compressed.len() <= requested_max;
+    let normal_would_exceed = content.len() > requested_max;
     if normal_would_exceed && within_budget {
         state.budget_enforcements.fetch_add(1, Relaxed);
     }
     let fmt_detected =
         detect_or_hint_format(content, format_hint).map(|f| format!("{f:?}").to_ascii_lowercase());
     let savings = record_and_savings(state, content.len(), compressed.len());
+    let view = encode_view("text", &compressed);
+    let (masked_view, masked_count) = mask_view(&view);
+    let bytes_saved = content.len() as i64 - compressed.len() as i64;
+    state.metrics.record_compress(tool, None, bytes_saved);
+    if masked_count > 0 {
+        state.metrics.record_masked(masked_count as u64);
+    }
     Ok(json!({
-        "view": encode_view("text", &compressed),
+        "view": masked_view,
         "original_bytes": content.len(),
         "compressed_bytes": compressed.len(),
         "within_budget": within_budget,
         "format_detected": fmt_detected,
+        "masked_count": masked_count,
+        "suggested_min_bytes": adaptive_floor,
         "savings": savings,
     }))
 }
@@ -795,10 +887,16 @@ fn handle_compress_append(state: &ServerState, args: &Value) -> Result<Value, St
             .fetch_add(accumulated_size as u64, Relaxed);
     }
     let savings = record_and_savings(state, new_bytes.len(), view_bytes.len());
+    let view = encode_view("text", &view_bytes);
+    let (masked_view, masked_count) = mask_view(&view);
+    if masked_count > 0 {
+        state.metrics.record_masked(masked_count as u64);
+    }
     Ok(json!({
-        "view": encode_view("text", &view_bytes),
+        "view": masked_view,
         "appended_bytes": new_bytes.len(),
         "view_bytes": view_bytes.len(),
+        "masked_count": masked_count,
         "savings": savings,
     }))
 }
@@ -823,7 +921,7 @@ fn handle_changed(state: &ServerState, args: &Value) -> Result<Value, String> {
     Ok(json!({ "changed": changed, "known": known }))
 }
 
-fn handle_stats(state: &ServerState) -> Result<Value, String> {
+fn handle_stats(state: &ServerState, args: &Value) -> Result<Value, String> {
     state.report_to_brain();
     let stats = state.store.stats().map_err(|e| e.to_string())?;
     let tot_orig = state.total_original.load(Relaxed);
@@ -836,8 +934,25 @@ fn handle_stats(state: &ServerState) -> Result<Value, String> {
     };
     let append_avoided = state.append_bytes_avoided.load(Relaxed);
     let total_bytes_saved = saved + append_avoided;
-    let tokens_saved = total_bytes_saved as f64 / BYTES_PER_TOKEN;
-    let cost_saved = tokens_saved * DEFAULT_RATE_PER_MTOK / 1_000_000.0;
+
+    // Model-aware token accounting
+    let model_id = args
+        .get("model")
+        .and_then(Value::as_str)
+        .map(|s| s.to_string())
+        .unwrap_or_else(piggybank_core::token_est::model_from_env);
+
+    let (resolved_model, pricing) = piggybank_core::token_est::model_pricing(&model_id);
+
+    // Classify by prose for a conservative estimate when we don't have the original bytes.
+    let tokens_saved = piggybank_core::token_est::tokens_from_bytes(
+        total_bytes_saved,
+        piggybank_core::token_est::ContentClass::Prose,
+    );
+    let cost_saved = tokens_saved / 1_000_000.0 * pricing.input_per_mtok;
+
+    let metrics = state.metrics.stats_json();
+
     Ok(json!({
         "store_entries": stats.entries,
         "store_bytes": stats.bytes,
@@ -847,14 +962,18 @@ fn handle_stats(state: &ServerState) -> Result<Value, String> {
         "lifetime_saved_bytes": saved,
         "lifetime_saved_pct": format!("{pct:.1}%"),
         "token_savings": {
+            "model": resolved_model,
             "estimated_input_tokens_saved": tokens_saved as u64,
+            "estimated_usd_saved": format!("{cost_saved:.6}"),
+            "pricing_source": "estimated — verify at https://www.anthropic.com/pricing",
+            "rate_per_mtok_usd": pricing.input_per_mtok,
+            "cache_read_rate_per_mtok_usd": pricing.cache_read_per_mtok,
             "skipped_resends": state.skipped_resends.load(Relaxed),
             "append_bytes_avoided": append_avoided,
             "budget_enforcements": state.budget_enforcements.load(Relaxed),
         },
-        "cost_estimate": {
-            "rate_per_mtok_usd": DEFAULT_RATE_PER_MTOK,
-            "estimated_usd_saved": format!("{cost_saved:.6}"),
-        },
+        "by_tool": metrics["by_tool"],
+        "by_key": metrics["by_key"],
+        "masked_total": metrics["masked_total"],
     }))
 }
