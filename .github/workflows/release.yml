@@ -103,8 +103,12 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
           registry-url: "https://registry.npmjs.org"
+
+      # Trusted publishing (OIDC) needs npm >= 11.5.1; Node 22 ships an older npm.
+      - name: Upgrade npm for trusted publishing
+        run: npm install -g npm@latest && npm --version
 
       - name: Verify npm version matches tag
         run: |
@@ -118,6 +122,6 @@ jobs:
 
       - name: Publish to npm
         working-directory: npm
+        # Auth comes from npm trusted publishing (GitHub OIDC), configured on
+        # npmjs.com for piggybank-mcp -> axetechnologies/piggybank, release.yml.
         run: npm publish --provenance --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

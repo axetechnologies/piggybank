@@ -2,12 +2,12 @@
 
 ## Prerequisites
 
-- **NPM_TOKEN** secret: add a granular npm automation token for the
-  `axetechnologies` npm scope to the GitHub repo under
-  `Settings → Secrets and variables → Actions → New repository secret`.
-  Name it exactly `NPM_TOKEN`.  The token must allow publishing without
-  interactive 2FA (use an automation token or configure "allowed IPs" trusted
-  publishing on npmjs.com).
+- **npm trusted publishing**: no token or secret is needed.  On npmjs.com open
+  `piggybank-mcp → Settings → Trusted Publisher` and add a GitHub Actions
+  publisher with organization `axetechnologies`, repository `piggybank`,
+  workflow filename `release.yml`, environment left blank.  The
+  `publish-npm` job authenticates with GitHub's OIDC token (`id-token: write`)
+  and npm >= 11.5.1, which the job installs.
 
 ## Release checklist
 
@@ -55,8 +55,7 @@
 
 | Step | Where |
 |---|---|
-| Add `NPM_TOKEN` secret | GitHub repo → Settings → Secrets → Actions |
-| Enable npm provenance (optional) | npmjs.com → package settings |
+| Add GitHub Actions trusted publisher (`axetechnologies/piggybank`, `release.yml`) | npmjs.com → piggybank-mcp → Settings → Trusted Publisher |
 | Confirm `id-token: write` permission is set | already in `release.yml` |
 
 ## Targets
